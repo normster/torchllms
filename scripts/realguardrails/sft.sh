@@ -19,7 +19,7 @@ BATCH_SIZE=$((4 * ACCUM_STEPS))
 
 torchrun --rdzv-backend=c10d --rdzv-endpoint=localhost:0 --nproc_per_node 4 torchllms/training/trainers/sft.py \
     --ckpt_paths /data/norman_mu/models/torchllms/${BASE}/consolidated.00.pth \
-    --tokenizer_config ${CONFIG} \
+    --template_config ${CONFIG} \
     --lr 2e-5 \
     --lr_scheduler cosine \
     --warmup_steps 200 \

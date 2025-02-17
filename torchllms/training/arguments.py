@@ -20,16 +20,10 @@ def get_parser():
         "Weights are allowed to not exist.",
     )
     parser.add_argument(
-        "--template_file",
+        "--template_config",
         type=str,
         default=None,
-        help="Template file name in torchllms/templates.",
-    )
-    parser.add_argument(
-        "--tokenizer_config",
-        type=str,
-        default=None,
-        help="Tokenizer config file name in torchllms/messages/configs.",
+        help="Template config file name in torchllms/messages/configs.",
     )
     parser.add_argument(
         "--max_seq_len",

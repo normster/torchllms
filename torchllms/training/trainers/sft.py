@@ -1,5 +1,6 @@
 import json
 import random
+import shutil
 import time
 from functools import partial
 from importlib import resources
@@ -172,9 +173,15 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(main_ckpt_dir)
     template_config = None
-    if args.tokenizer_config:
-        with resources.files(configs).joinpath(args.tokenizer_config).open() as file:
+    if args.template_config:
+        config_path = resources.files(configs).joinpath(args.template_config)
+        with config_path.open() as file:
             template_config = tokenization.TemplateConfig(**yaml.safe_load(file))
+
+        if args.output_dir is not None:
+            config_path_json = config_path.with_suffix(".json")
+            target_path = args.output_dir / "tokenizer_config.json"
+            shutil.copy(str(config_path_json.resolve()), str(target_path.resolve()))
 
     # Prepare the data
     if global_rank == 0:

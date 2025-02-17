@@ -22,8 +22,6 @@ For example, with LLaMA models we use `llama3_instruct.yaml` which defines:
 - Role tokens for system/user/assistant messages
 - Token masking rules for training
 
-After training, replace the model's `tokenizer_config.json` with the corresponding `.json` file (e.g., `llama3_instruct.json` for Llama 3 fine-tunes) for compatibility.
-
 ## Training Data Formats
 
 ### SFT Data
@@ -65,7 +63,7 @@ Standard cross-entropy training on conversation data:
 ```bash
 torchrun --nproc_per_node 1 torchllms/training/trainers/sft.py \
     --ckpt_paths checkpoints/llama3.1_8b_instruct/consolidated.00.pth \
-    --tokenizer_config llama3_instruct.yaml \
+    --template_config llama3_instruct.yaml \
     --lr 1e-6 \
     --lr_scheduler cosine \
     --warmup_steps 5 \
@@ -84,7 +82,7 @@ Trains on preference data using DPO loss:
 ```bash
 torchrun --nproc_per_node 1 torchllms/training/trainers/dpo.py \
     --ckpt_paths checkpoints/llama3.1_8b_instruct/consolidated.00.pth \
-    --tokenizer_config llama3_instruct.yaml \
+    --template_config llama3_instruct.yaml \
     --lr 5e-7 \
     --lr_scheduler cosine \
     --dpo_beta 0.01 \
@@ -102,7 +100,7 @@ Alternative preference learning using margin-based loss:
 ```bash
 torchrun --nproc_per_node 1 torchllms/training/trainers/simpo.py \
     --ckpt_paths checkpoints/llama3.1_8b_instruct/consolidated.00.pth \
-    --tokenizer_config llama3_instruct.yaml \
+    --template_config llama3_instruct.yaml \
     --lr 5e-7 \
     --lr_scheduler cosine \
     --simpo_beta 1.0 \
@@ -130,7 +128,7 @@ All training modes support LoRA by adding:
 All trainers share these core arguments:
 
 - `--ckpt_paths`: Path(s) to model checkpoint(s)
-- `--tokenizer_config`: YAML config for tokenizer (e.g. llama3_instruct.yaml)
+- `--template_config`: YAML config for chat template (e.g. `llama3_instruct.yaml`)
 - `--max_seq_len`: Maximum sequence length
 - `--micro_batch_size_per_gpu`: Batch size per GPU
 - `--gradient_accum_steps`: Number of gradient accumulation steps
@@ -140,7 +138,8 @@ All trainers share these core arguments:
 
 `--train_data_paths` supports:
 - HuggingFace datasets: `HuggingFaceH4/ultrachat_200k`
-- Local jsonl files: `jsonl:path/to/data.jsonl`
+- Local jsonl files: `jsonl:/path/to/data.jsonl`
+- Local text files: `text:/path/to/data.txt`
 - Local HF datasets: `local:/path/to/dataset`
 
 ### Optimization Arguments

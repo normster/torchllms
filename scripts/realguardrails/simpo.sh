@@ -12,7 +12,7 @@ GAMMA=${7:-1}
 
 torchrun --rdzv-backend=c10d --rdzv-endpoint=localhost:0 --nproc_per_node 8 torchllms/training/trainers/simpo.py \
     --ckpt_paths /data/norman_mu/code/torchllms/outputs/${BASE}/model_final.pth \
-    --tokenizer_config ${CONFIG} \
+    --template_config ${CONFIG} \
     --lr ${LR} \
     --lr_scheduler cosine \
     --clip_grad_norm 1.0 \

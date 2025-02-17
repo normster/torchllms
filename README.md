@@ -15,7 +15,7 @@ We also implement basic inference code, using KV caching and batched decoding, f
 
 This repo uses a custom format for model weights than the standard HuggingFace format, based on the [original Llama implementation](https://github.com/meta-llama/llama/blob/main/llama/model.py). You can convert between the two formats with [torchllms/models/checkpoint_converter.py](torchllms/models/checkpoint_converter.py).
 
-We also use a custom chat template system, specified in [torchllms/messages/tokenization.py](torchllms/messages/tokenization.py), which records message role IDs. There are slight differences in the exact format between our library and official Jinja2 chat templates published on HF, so to match training/inference templates you should replace fine-tuned models' `tokenizer_config.json` files with ones from [torchllms/messages/configs](torchllms/messages/configs) (`llama3_instuct.json`, `qwen2_5_instruct.json`, `olmo2_instruct.json`).
+We also use a custom chat template system, specified in [torchllms/messages/tokenization.py](torchllms/messages/tokenization.py), which records message role IDs. There are slight differences in the exact format between our library and official Jinja2 chat templates published on HF, so to match training/inference templates the training scripts automatically copy over the corresponding `tokenizer_config.json` file from [torchllms/messages/configs](torchllms/messages/configs) based on the `--template_config` argument (e.g. `llama3_instuct.yaml` -> `llama3_instuct.json`, etc.).
 
 ## Installation
 
@@ -34,7 +34,7 @@ The general workflow for using this library looks something like:
 1. Download HF weights.
 2. Convert HF weights to torchllms format with [torchllms/models/checkpoint_converter.py](torchllms/models/checkpoint_converter.py)
 3. Finetune the model with [torchllms/training/trainers/sft.py](torchllms/training/trainers/sft.py), or included DPO and SimPO scripts.
-4. Convert back to HF format with `checkpoint_converter.py` and copy over corresponding `tokenizer_config.json` file from [torchllms/messages/configs](torchllms/messages/configs).
+4. Convert back to HF format with `checkpoint_converter.py`.
 
 ### Converting from HF weights
 Assuming we are using Llama-3 8B Instruct:
@@ -53,7 +53,7 @@ Finetuning is supported for local/remote HuggingFace datasets, as well as local 
 ```bash
 torchrun --nproc_per_node 1 torchllms/training/trainers/sft.py \
     --ckpt_paths outputs/llama3.2_1b_instruct/consolidated.00.pth \
-    --tokenizer_config llama3_instruct.yaml \
+    --template_config llama3_instruct.yaml \
     --lr 1e-4 \
     --lr_scheduler cosine \
     --warmup_steps 20 \
@@ -77,7 +77,7 @@ LoRA can be enabled with the `--lora` flag. This freezes the LLM weights and onl
 ```bash
 torchrun --nproc_per_node 1 torchllms/training/trainers/sft.py \
     --ckpt_paths outputs/llama3.2_1b_instruct/consolidated.00.pth \
-    --tokenizer_config llama3_instruct.yaml \
+    --template_config llama3_instruct.yaml \
     --lr 1e-3 \
     --lr_scheduler constant \
     --warmup_steps 20 \

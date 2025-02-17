@@ -22,7 +22,7 @@ torchrun --rdzv-backend=c10d --rdzv-endpoint=localhost:0 --nproc_per_node 4 torc
     --ckpt_paths /data/norman_mu/models/torchllms/${BASE}/consolidated.00.pth \
     --use_role_embeddings \
     --role_embeddings_init $INIT \
-    --tokenizer_config ${CONFIG} \
+    --template_config ${CONFIG} \
     --lr 2e-5 \
     --lr_scheduler cosine \
     --warmup_steps 200 \
