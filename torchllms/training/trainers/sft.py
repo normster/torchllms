@@ -178,7 +178,7 @@ def main():
         with config_path.open() as file:
             template_config = tokenization.TemplateConfig(**yaml.safe_load(file))
 
-        if args.output_dir is not None:
+        if global_rank == 0 and args.output_dir is not None:
             config_path_json = config_path.with_suffix(".json")
             target_path = args.output_dir / "tokenizer_config.json"
             shutil.copy(str(config_path_json.resolve()), str(target_path.resolve()))
