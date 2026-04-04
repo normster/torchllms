@@ -65,7 +65,19 @@ class ModelParams(BaseModel):
     use_role_embeddings: bool = False
     role_embeddings_init: str = "zeros"
     olmo2_arch: bool = False
+    gpt_oss_arch: bool = False
     attention_impl: AttentionImpl = AttentionImpl.FLASH
+
+    # gpt-oss MoE parameters
+    gpt_oss_num_experts: int = 128
+    gpt_oss_experts_per_token: int = 4
+    gpt_oss_intermediate_size: int = 2880
+    gpt_oss_swiglu_limit: float = 7.0
+    gpt_oss_sliding_window: int = 128
+    gpt_oss_initial_context_length: int = 4096
+    gpt_oss_rope_scaling_factor: float = 32.0
+    gpt_oss_rope_ntk_alpha: float = 1.0
+    gpt_oss_rope_ntk_beta: float = 32.0
 
     model_config = {"extra": "ignore"}
 
@@ -531,7 +543,10 @@ class TransformerBlock(nn.Module):
 class Transformer(nn.Module):
     @classmethod
     def from_params(cls, params: ModelParams):
-        if params.olmo2_arch:
+        if params.gpt_oss_arch:
+            from torchllms.models.networks_gptoss import GptOSSTransformer
+            return GptOSSTransformer(params)
+        elif params.olmo2_arch:
             from torchllms.models.networks_olmo import OLMo2Transformer
             return OLMo2Transformer(params)
         else:
