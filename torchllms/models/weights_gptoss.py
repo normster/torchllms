@@ -137,7 +137,9 @@ def _build_name_map(n_layers: int) -> Dict[str, str]:
         # Attention
         name_map[f"{prefix_ckpt}.attn.norm.scale"] = f"{prefix_model}.attn.norm.weight"
         name_map[f"{prefix_ckpt}.attn.qkv.weight"] = f"{prefix_model}.attn.qkv.weight"
+        name_map[f"{prefix_ckpt}.attn.qkv.bias"] = f"{prefix_model}.attn.qkv.bias"
         name_map[f"{prefix_ckpt}.attn.out.weight"] = f"{prefix_model}.attn.out.weight"
+        name_map[f"{prefix_ckpt}.attn.out.bias"] = f"{prefix_model}.attn.out.bias"
         name_map[f"{prefix_ckpt}.attn.sinks"] = f"{prefix_model}.attn.sinks"
 
         # MLP / MoE
@@ -301,8 +303,35 @@ def setup_gptoss(
             logger.info(f"  Loaded MoE weights for layers 0..{n}")
             torch.cuda.empty_cache()
 
-    # Move remaining meta tensors to device
-    model = model.to(dtype=torch.bfloat16, device=device)
+    # Materialize any remaining meta tensors (e.g. unused optional weight slots)
+    # Can't use model.to() because it chokes on meta tensors, and can't use
+    # to_empty() because it overwrites already-loaded weights.
+    for name, param in list(model.named_parameters()):
+        if param.device.type == "meta":
+            parts = name.split(".")
+            parent = model
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            setattr(parent, parts[-1], nn.Parameter(
+                torch.zeros(param.shape, dtype=torch.bfloat16, device=device),
+                requires_grad=param.requires_grad,
+            ))
+    for name, buf in list(model.named_buffers()):
+        if buf.device.type == "meta":
+            parts = name.split(".")
+            parent = model
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            parent.register_buffer(parts[-1], torch.zeros(
+                buf.shape, dtype=torch.bfloat16, device=device
+            ))
+
+    # Reinitialize RoPE caches — the meta→zero materialization above
+    # overwrites the cos/sin buffers computed during __init__.
+    for layer in model.layers:
+        layer.attn.rope.reset_parameters()
+        layer.attn.rope.to(device)
+
     model.eval()
 
     total_params = sum(p.numel() for p in model.parameters())

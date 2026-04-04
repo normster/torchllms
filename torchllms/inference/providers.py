@@ -234,21 +234,23 @@ class torchllms(BaseProvider):
 
 
 class OpenAI(BaseProvider):
-    def __init__(self, model: str, concurrency: int = 20):
+    def __init__(self, model: str, concurrency: int = 20, api_key: str = None, base_url: str = None):
         import openai
 
         self.model = model
         self.concurrency = concurrency
 
-        if "gemini" in model.lower():
-            api_key = os.getenv("GEMINI_API_KEY")
-            base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-        elif "deepseek" in model.lower():
-            api_key = os.environ.get("TOGETHER_API_KEY")
-            base_url = "https://api.together.xyz/v1"
-        else:
-            api_key = os.getenv("OPENAI_API_KEY")
-            base_url = None
+        if api_key is None or base_url is None:
+            if "gemini" in model.lower():
+                api_key = api_key or os.getenv("GEMINI_API_KEY")
+                base_url = base_url or "https://generativelanguage.googleapis.com/v1beta/openai/"
+            elif "deepseek" in model.lower():
+                api_key = api_key or os.environ.get("TOGETHER_API_KEY")
+                base_url = base_url or "https://api.together.xyz/v1"
+            else:
+                api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+                if api_key == os.getenv("OPENROUTER_API_KEY"):
+                    base_url = base_url or "https://openrouter.ai/api/v1"
 
         self.client = openai.OpenAI(
             api_key=api_key,
@@ -256,20 +258,57 @@ class OpenAI(BaseProvider):
             max_retries=3,
         )
 
+    @staticmethod
+    def _msg_preview(messages):
+        msg = next((m["content"] for m in messages if m["role"] == "user"), "")
+        return msg[:100].replace("\n", " ")
+
     def _get_completion(self, messages, **kwargs):
+        import openai
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 **kwargs,
             )
+        except openai.APIStatusError as e:
+            print(f"[OpenAI] HTTP {e.status_code} for '{self._msg_preview(messages)}': "
+                  f"{e.message}")
+            if hasattr(e, "body"):
+                print(f"  body: {e.body}")
+            return "missing"
+        except openai.APIConnectionError as e:
+            print(f"[OpenAI] Connection error for '{self._msg_preview(messages)}': {e}")
+            return "missing"
         except Exception as e:
-            print(e)
+            print(f"[OpenAI] {type(e).__name__} for '{self._msg_preview(messages)}': {e}")
             return "missing"
 
-        if len(response.choices) > 0 and response.choices[0].message.content:
-            return response.choices[0].message.content
+        try:
+            content = response.choices[0].message.content
+            if content:
+                return content
+        except (IndexError, AttributeError, TypeError):
+            pass
 
+        # Diagnose why we got no content
+        preview = self._msg_preview(messages)
+        usage = ""
+        if hasattr(response, "usage") and response.usage:
+            u = response.usage
+            reasoning = getattr(u, "completion_tokens_details", None)
+            usage = (f" | usage: prompt={u.prompt_tokens} completion={u.completion_tokens}"
+                     f" reasoning={reasoning}")
+
+        if not response.choices:
+            print(f"[OpenAI] No choices for '{preview}'{usage}")
+            print(f"  raw response: {response.model_dump_json()[:500]}")
+        else:
+            choice = response.choices[0]
+            print(f"[OpenAI] Empty content for '{preview}': "
+                  f"finish_reason={choice.finish_reason}, "
+                  f"refusal={getattr(choice.message, 'refusal', None)}{usage}")
         return "missing"
 
     def generate(
@@ -306,6 +345,10 @@ class OpenAI(BaseProvider):
                 print(
                     "Keyboard interrupt received. Shutting down and saving results..."
                 )
+
+        n_missing = sum(1 for c in conversations if c[-1].get("content") == "missing")
+        if n_missing > 0:
+            print(f"[OpenAI] WARNING: {n_missing}/{len(conversations)} responses are 'missing'")
 
         return conversations
 

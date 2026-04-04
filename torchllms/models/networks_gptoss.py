@@ -22,15 +22,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torchllms.models.attention_gptoss import attention as triton_attention
+from torchllms.models.attention_gptoss import attention_ref
 from torchllms.models.cache import DecodingCache
 from torchllms.models.networks import (
-    AttentionImpl,
     ModelParams,
     RMSNorm,
     RoleEmbeddings,
-    _eager_attention,
-    _sdpa_attention,
-    to_4d_and_causal,
 )
 
 
@@ -100,17 +98,20 @@ class YaRNRotaryEmbeddings(nn.Module):
 
         seq_idx = torch.arange(self.max_seq_len, dtype=torch.float32)
         freqs = torch.einsum("i,j->ij", seq_idx, inv_freq)
+        # Cache cos/sin as [max_seq_len, head_dim//2] for half-split rotation
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
-
-        # Cache as [max_seq_len, head_dim//2, 2] for the rotation
-        cache = torch.stack([cos, sin], dim=-1)
-        self.register_buffer("cache", cache, persistent=False)
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
 
     def forward(
         self, x: torch.Tensor, *, input_pos: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Apply rotary embeddings.
+        """Apply rotary embeddings using half-split convention.
+
+        The reference gpt-oss implementation splits each head into first half
+        and second half (not interleaved pairs), matching the standard RoPE
+        convention from the original paper.
 
         Args:
             x: [bsz, seqlen, n_heads, head_dim]
@@ -120,23 +121,33 @@ class YaRNRotaryEmbeddings(nn.Module):
         """
         seq_len = x.size(1)
 
-        rope_cache = (
-            self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
-        )
+        if input_pos is None:
+            cos = self.cos_cached[:seq_len]  # [seqlen, head_dim//2]
+            sin = self.sin_cached[:seq_len]
+        else:
+            cos = self.cos_cached[input_pos]  # [bsz, seqlen, head_dim//2]
+            sin = self.sin_cached[input_pos]
 
-        xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-        rope_cache = rope_cache.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
+        # Broadcast cos/sin to match x shape: add head dimension
+        # x is [bsz, seqlen, n_heads, head_dim]
+        # cos/sin need to be [..., 1, head_dim//2] for broadcasting
+        if cos.dim() == 2:
+            # [seqlen, head_dim//2] -> [1, seqlen, 1, head_dim//2]
+            cos = cos.unsqueeze(0).unsqueeze(2)
+            sin = sin.unsqueeze(0).unsqueeze(2)
+        else:
+            # [bsz, seqlen, head_dim//2] -> [bsz, seqlen, 1, head_dim//2]
+            cos = cos.unsqueeze(2)
+            sin = sin.unsqueeze(2)
 
-        x_out = torch.stack(
-            [
-                xshaped[..., 0] * rope_cache[..., 0]
-                - xshaped[..., 1] * rope_cache[..., 1],
-                xshaped[..., 1] * rope_cache[..., 0]
-                + xshaped[..., 0] * rope_cache[..., 1],
-            ],
-            -1,
-        )
-        return x_out.flatten(3).type_as(x)
+        cos = cos.to(x.dtype)
+        sin = sin.to(x.dtype)
+
+        # Half-split rotation: split head_dim into first half and second half
+        x1, x2 = x.chunk(2, dim=-1)
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.cat((o1, o2), dim=-1)
 
 
 def _gptoss_swiglu(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0):
@@ -151,7 +162,6 @@ class GptOSSAttention(nn.Module):
 
     def __init__(self, layer_id: int, params: ModelParams):
         super().__init__()
-        self.params = params
         self.layer_id = layer_id
         self.head_dim = params.head_dim
         self.n_heads = params.n_heads
@@ -168,8 +178,8 @@ class GptOSSAttention(nn.Module):
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
 
         qkv_dim = params.head_dim * (params.n_heads + 2 * params.n_kv_heads)
-        self.qkv = nn.Linear(params.dim, qkv_dim, bias=False)
-        self.out = nn.Linear(params.n_heads * params.head_dim, params.dim, bias=False)
+        self.qkv = nn.Linear(params.dim, qkv_dim, bias=True)
+        self.out = nn.Linear(params.n_heads * params.head_dim, params.dim, bias=True)
 
         self.sm_scale = 1.0 / math.sqrt(params.head_dim)
 
@@ -207,16 +217,32 @@ class GptOSSAttention(nn.Module):
         q = self.rope(q, input_pos=input_pos)
         k = self.rope(k, input_pos=input_pos)
 
+        # Compute start_q for the attention kernel (position of first query token)
+        if input_pos is not None:
+            start_q = input_pos[:, 0:1].to(torch.long)
+        elif cache is not None:
+            start_q = cache.next_start_pos[:1].to(torch.long)
+        else:
+            start_q = torch.zeros(1, dtype=torch.long, device=x.device)
+
         if cache is not None:
             k, v = cache.update_kv(self.layer_id, k, v)
 
-        # Use standard attention implementations (sink tokens not used with
-        # SDPA/flash — they are a minor detail for correctness at scale but
-        # don't affect the hidden states meaningfully for our probe work)
-        if self.params.attention_impl == AttentionImpl.SDPA:
-            output = _sdpa_attention(q, k, v, attn_mask)
+        # GQA: reshape q to [bsz, seqlen, n_kv_heads, q_per_kv, head_dim]
+        q_per_kv = self.n_heads // self.n_kv_heads
+        q = q.view(bsz, seqlen, self.n_kv_heads, q_per_kv, self.head_dim)
+
+        # Triton kernel for prefill (seqlen >= 64), eager ref for decode
+        if seqlen >= 64 and x.is_cuda:
+            output = triton_attention(
+                q, k, v, self.sinks, self.sm_scale,
+                self.sliding_window, start_q,
+            )
         else:
-            output = _eager_attention(q, k, v, attn_mask)
+            output = attention_ref(
+                q, k, v, self.sinks, self.sm_scale,
+                self.sliding_window, start_q,
+            )
 
         return self.out(output)
 
@@ -234,30 +260,21 @@ class MXFPStorage:
         self.scales = scales  # [num_experts, G] uint8
 
     def decode(self, expert_id: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-        """Decode a single expert's weight from MXFP4 to bf16."""
-        b = self.blocks[expert_id]   # [G, B]
-        s = self.scales[expert_id]   # [G]
+        """Decode a single expert's weight from MXFP4 to bf16.
 
-        lut = torch.tensor(FP4_VALUES, dtype=dtype, device=b.device)
-        s_int = s.to(torch.int32) - 127  # [G]
+        Blocks may be [num_experts, rows, groups, B] or [num_experts, G, B].
+        Scales are one dim less (no B). Output is the fully decoded weight matrix.
+        """
+        b = self.blocks[expert_id]   # [*prefix, B]
+        s = self.scales[expert_id]   # [*prefix]
 
-        idx_lo = (b & 0x0F).to(torch.long)
-        idx_hi = (b >> 4).to(torch.long)
-
-        G, B = b.shape
-        out = torch.empty(G, B * 2, dtype=dtype, device=b.device)
-        out[:, 0::2] = lut[idx_lo]
-        out[:, 1::2] = lut[idx_hi]
-        torch.ldexp(out, s_int.unsqueeze(-1), out=out)
-
-        return out  # [G, B*2] — the decoded weight matrix (flattened)
-
-    def decode_batch(
-        self, expert_ids: torch.Tensor, dtype: torch.dtype = torch.bfloat16
-    ) -> torch.Tensor:
-        """Decode multiple experts at once. expert_ids: 1D tensor of expert indices."""
-        b = self.blocks[expert_ids]  # [N, G, B]
-        s = self.scales[expert_ids]  # [N, G]
+        # Flatten to [total_groups, B]
+        *prefix, B = b.shape
+        total_groups = 1
+        for d in prefix:
+            total_groups *= d
+        b = b.reshape(total_groups, B)
+        s = s.reshape(total_groups)
 
         lut = torch.tensor(FP4_VALUES, dtype=dtype, device=b.device)
         s_int = s.to(torch.int32) - 127
@@ -265,13 +282,13 @@ class MXFPStorage:
         idx_lo = (b & 0x0F).to(torch.long)
         idx_hi = (b >> 4).to(torch.long)
 
-        N, G, B = b.shape
-        out = torch.empty(N, G, B * 2, dtype=dtype, device=b.device)
-        out[:, :, 0::2] = lut[idx_lo]
-        out[:, :, 1::2] = lut[idx_hi]
+        out = torch.empty(total_groups, B * 2, dtype=dtype, device=b.device)
+        out[:, 0::2] = lut[idx_lo]
+        out[:, 1::2] = lut[idx_hi]
         torch.ldexp(out, s_int.unsqueeze(-1), out=out)
 
-        return out  # [N, G, B*2]
+        # Return flattened: [total_groups * B * 2]
+        return out.reshape(-1)
 
 
 # FP4 lookup table for MXFP4 decoding
