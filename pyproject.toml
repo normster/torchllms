@@ -25,7 +25,7 @@ dependencies = [
     "pyyaml",
     "rich",
     "sentencepiece",
-    "torch",
+    "torch>=2.8.0,<2.9",
     "transformers",
     "tqdm",
 ]
