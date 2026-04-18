@@ -3,15 +3,11 @@ Harmony tokenization for gpt-oss models.
 
 Uses the openai-harmony SDK for correct token rendering and produces
 (input_ids, role_ids) pairs compatible with the torchllms inference pipeline.
-
-Role IDs track the ground-truth role of each token, which is critical for
-role probe training and activation steering experiments.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from openai_harmony import (
-    Author,
     Conversation,
     HarmonyEncodingName,
     Message as HarmonyMessage,
@@ -36,10 +32,6 @@ HARMONY_ROLE_MAP = {
     "assistant": Role.ASSISTANT,
     "tool": Role.TOOL,
 }
-
-# Probe role labels (4 classes, CoT merged into assistant)
-PROBE_ROLES = ["system", "user", "assistant", "tool"]
-PROBE_ROLE_TO_INT = {r: i for i, r in enumerate(PROBE_ROLES)}
 
 
 def _get_encoding():
@@ -144,139 +136,3 @@ def _assign_role_ids_from_tokens(
     return role_ids
 
 
-def _render_simple_message(enc, harmony_role, text, channel=None) -> List[int]:
-    """Render a single Harmony message."""
-    msg = HarmonyMessage.from_role_and_content(harmony_role, text)
-    if channel:
-        msg = msg.with_channel(channel)
-    return list(enc.render(msg))
-
-
-def _render_tool_message(enc, text) -> List[int]:
-    """Render a tool message in Harmony format."""
-    author = Author(role=HarmonyRole.TOOL, name="functions.stub")
-    msg = HarmonyMessage.from_author_and_content(author, text)
-    msg = msg.with_recipient(HarmonyRole.ASSISTANT).with_channel("commentary")
-    return list(enc.render(msg))
-
-
-def _find_content_mask(tokens: List[int]) -> List[bool]:
-    """Find content tokens (between <|message|> and <|end|>) in a token list."""
-    mask = [False] * len(tokens)
-    in_content = False
-    for i, t in enumerate(tokens):
-        if t == HARMONY_MESSAGE:
-            in_content = True
-            continue
-        if t == HARMONY_END:
-            in_content = False
-            continue
-        if in_content:
-            mask[i] = True
-    return mask
-
-
-def _find_last_content_mask(tokens: List[int]) -> List[bool]:
-    """Find content tokens in the LAST message only (last <|message|>...<|end|> span)."""
-    # Find all message/end pairs, take the last one
-    spans = []
-    in_content = False
-    start = 0
-    for i, t in enumerate(tokens):
-        if t == HARMONY_MESSAGE:
-            in_content = True
-            start = i + 1
-        elif t == HARMONY_END and in_content:
-            spans.append((start, i))
-            in_content = False
-
-    mask = [False] * len(tokens)
-    if spans:
-        start, end = spans[-1]
-        for i in range(start, end):
-            mask[i] = True
-    return mask
-
-
-def tokenize_for_probe(
-    passage: str,
-    role: str,
-    filler: Optional[str] = None,
-    assistant_variant: str = "cot",
-) -> Tuple[List[int], List[bool]]:
-    """Tokenize a passage wrapped in a role's Harmony format for probe training.
-
-    For the assistant role, two variants are used (selected by caller):
-      - "cot": Content goes in analysis channel. No filler needed.
-            <|start|>assistant<|channel|>analysis<|message|>{PASSAGE}<|end|>
-      - "final": Filler goes in analysis channel, content in final channel.
-            <|start|>assistant<|channel|>analysis<|message|>{FILLER}<|end|>
-            <|start|>assistant<|channel|>final<|message|>{PASSAGE}<|end|>
-        When this variant is used, all OTHER roles also get filler prepended
-        (as a developer message) for positional controls.
-
-    Per Ye et al. 2026, Appendix G.1: this prevents the probe from learning
-    position as a shortcut.
-
-    Args:
-        passage: The neutral text to wrap.
-        role: One of "system", "user", "assistant", "tool".
-        filler: Filler text for positional controls. For non-assistant roles,
-            prepended as a developer message. For assistant "final" variant,
-            placed inside the analysis channel.
-        assistant_variant: "cot" or "final" (only used when role=="assistant").
-    Returns:
-        (input_ids, content_mask) where content_mask[i] is True for tokens
-        that are part of the passage content (not role tags or filler).
-    """
-    enc = _get_encoding()
-    tokens = []
-
-    if role == "assistant":
-        if assistant_variant == "cot":
-            # Content directly in analysis channel, no filler
-            role_tokens = _render_simple_message(
-                enc, HarmonyRole.ASSISTANT, passage, channel="analysis"
-            )
-            tokens.extend(role_tokens)
-            content_mask = _find_content_mask(role_tokens)
-        else:
-            # Filler in analysis, content in final
-            if filler:
-                filler_tokens = _render_simple_message(
-                    enc, HarmonyRole.ASSISTANT, filler, channel="analysis"
-                )
-                tokens.extend(filler_tokens)
-            content_tokens = _render_simple_message(
-                enc, HarmonyRole.ASSISTANT, passage, channel="final"
-            )
-            pre_len = len(tokens)
-            tokens.extend(content_tokens)
-            content_mask = [False] * pre_len + _find_content_mask(content_tokens)
-    else:
-        # Non-assistant roles: optionally prepend filler as developer message
-        if filler:
-            filler_tokens = _render_simple_message(
-                enc, HarmonyRole.DEVELOPER, filler
-            )
-            tokens.extend(filler_tokens)
-
-        pre_len = len(tokens)
-        if role == "system":
-            role_tokens = _render_simple_message(
-                enc, HarmonyRole.DEVELOPER, passage
-            )
-        elif role == "user":
-            role_tokens = _render_simple_message(
-                enc, HarmonyRole.USER, passage
-            )
-        elif role == "tool":
-            role_tokens = _render_tool_message(enc, passage)
-        else:
-            raise ValueError(f"Unknown role: {role}")
-
-        tokens.extend(role_tokens)
-        content_mask = [False] * pre_len + _find_content_mask(role_tokens)
-
-    assert len(tokens) == len(content_mask)
-    return tokens, content_mask
