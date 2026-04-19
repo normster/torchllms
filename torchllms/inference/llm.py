@@ -21,9 +21,9 @@ from torchllms.models.networks import AttentionImpl
 
 
 def get_batches(iterable, n=1):
-    l = len(iterable)
-    for ndx in range(0, l, n):
-        yield iterable[ndx : min(ndx + n, l)]
+    total = len(iterable)
+    for ndx in range(0, total, n):
+        yield iterable[ndx : min(ndx + n, total)]
 
 
 class LLM:
@@ -138,7 +138,12 @@ class LLM:
             device=self.device,
         )
 
-        logits, cache = self.model(input_ids=input_ids, role_ids=role_ids, cache=cache)
+        logits, cache = self.model(
+            input_ids=input_ids,
+            role_ids=role_ids,
+            cache=cache,
+            logits_to_keep=1,
+        )
         cur_token, _ = inference.utils.sample(logits, temperature=temperature)
 
         new_tokens[0] = cur_token.squeeze()
@@ -151,6 +156,7 @@ class LLM:
                 input_ids=cur_token.view(1, -1),
                 role_ids=asst_role,
                 cache=cache,
+                logits_to_keep=1,
             )
             cur_token, _ = inference.utils.sample(logits, temperature=temperature)
 
@@ -324,6 +330,7 @@ class LLM:
             cache=cache,
             attn_mask=attn_mask,
             input_pos=input_pos,
+            logits_to_keep=1,
         )
         cur_tokens, _ = inference.utils.sample(logits, temperature=temperature)
 
@@ -351,6 +358,7 @@ class LLM:
                 input_ids=cur_tokens.unsqueeze(1),
                 role_ids=asst_role,
                 cache=cache,
+                logits_to_keep=1,
             )  # len: B_active
             cur_tokens, _ = inference.utils.sample(logits, temperature=temperature)
 

@@ -15,9 +15,9 @@ from torchllms.models.networks import AttentionImpl
 
 
 def get_batches(sequence: Sequence, n: int = 1):
-    l = len(sequence)
-    for ndx in range(0, l, n):
-        yield sequence[ndx : min(ndx + n, l)]
+    total = len(sequence)
+    for ndx in range(0, total, n):
+        yield sequence[ndx : min(ndx + n, total)]
 
 
 class ContrastiveLLM:
@@ -145,7 +145,12 @@ class ContrastiveLLM:
             device=self.device,
         )
 
-        logits, cache = self.model(input_ids=input_ids, role_ids=role_ids, cache=cache)
+        logits, cache = self.model(
+            input_ids=input_ids,
+            role_ids=role_ids,
+            cache=cache,
+            logits_to_keep=1,
+        )
         last_token_logits = logits[:, -1]
         if logit_processor is not None:
             neg_encoding = {
@@ -168,6 +173,7 @@ class ContrastiveLLM:
                 input_ids=cur_token.view(1, -1),
                 role_ids=asst_role,
                 cache=cache,
+                logits_to_keep=1,
             )
             last_token_logits = logits[:, -1]
             if logit_processor is not None:
@@ -388,6 +394,7 @@ class ContrastiveLLM:
             cache=cache,
             attn_mask=attn_mask,
             input_pos=input_pos,
+            logits_to_keep=1,
         )
         last_token_logits = logits[:, -1]
         if logit_processor is not None:
@@ -435,6 +442,7 @@ class ContrastiveLLM:
                 input_ids=cur_tokens.unsqueeze(1),
                 role_ids=asst_role,
                 cache=cache,
+                logits_to_keep=1,
             )  # len: B_active
             last_token_logits = logits[:, -1]
             if logit_processor is not None:
@@ -596,7 +604,7 @@ class ContrastiveLLM:
 
 
 if __name__ == "__main__":
-    llm = LLM(
+    llm = ContrastiveLLM(
         ckpt_paths=[
             "/storage_fast/models/torchllms/llama3_8b_instruct/consolidated.00.pth"
         ],

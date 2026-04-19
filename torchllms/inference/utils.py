@@ -34,6 +34,9 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
 
 
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
+    if logits.dim() == 3:
+        logits = logits[:, -1, :]
+
     if temperature == 0:
         idx_next = torch.argmax(logits, dim=-1)
         probs = torch.zeros_like(logits)

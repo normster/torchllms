@@ -59,6 +59,7 @@ class BaseContrastiveLogitsProcessor(abc.ABC):
                 cache=self.cache,
                 attn_mask=attn_mask,
                 input_pos=input_pos,
+                logits_to_keep=1,
             )
         neg_logprobs = F.log_softmax(logits[:, -1], dim=-1)
 

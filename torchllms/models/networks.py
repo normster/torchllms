@@ -606,6 +606,7 @@ class Transformer(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[DecodingCache] = None,
+        logits_to_keep: Optional[int] = None,
     ):
         """
         Apply a single forward pass for training or inference (prefill + decoding).
@@ -618,9 +619,13 @@ class Transformer(nn.Module):
             input_pos: Optional per-token input positions to the model used for
                 positional embeddings. (bsz, seqlen) or (seqlen,)
             cache: Optional decoding cache (past kv, position ids, etc).
+            logits_to_keep: Optional number of trailing sequence positions to
+                project to vocabulary logits. Generation only needs 1; training
+                and scoring should leave this unset to get full-sequence logits.
 
         Returns:
-            logits: The model's output logits for all input tokens.
+            logits: The model's output logits. If logits_to_keep is set, only
+                that many trailing positions are returned.
             cache: The updated cache, if provided.
 
         In decoding steps during generation, `input_ids` and `role_ids` should
@@ -656,6 +661,9 @@ class Transformer(nn.Module):
 
         for i, layer in enumerate(self.layers):
             h = layer(h, role_ids, attn_mask, input_pos, cache)
+
+        if logits_to_keep is not None:
+            h = h[:, -logits_to_keep:]
 
         logits = self.output(self.norm(h))
 

@@ -526,6 +526,7 @@ class GptOSSTransformer(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[DecodingCache] = None,
+        logits_to_keep: Optional[int] = None,
     ):
         assert (
             cache is None or not cache.is_full()
@@ -547,6 +548,9 @@ class GptOSSTransformer(nn.Module):
 
         for layer in self.layers:
             h = layer(h, role_ids, attn_mask, input_pos, cache)
+
+        if logits_to_keep is not None:
+            h = h[:, -logits_to_keep:]
 
         logits = self.output(self.norm(h))
 
