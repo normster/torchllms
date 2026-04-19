@@ -15,6 +15,7 @@ import torch
 from tqdm import tqdm
 
 from torchllms import inference
+from torchllms.inference.prefix_cache import RadixKVCache
 from torchllms.messages import tokenization
 from torchllms.models import utils
 from torchllms.models.networks import AttentionImpl
@@ -51,6 +52,7 @@ class LLM:
         precision: str = "bfloat16",
         model_kwargs: Optional[Dict[str, Any]] = None,
         batched: bool = False,
+        prefix_cache: Optional[RadixKVCache] = None,
     ):
         model, tokenizer, template_config = utils.setup_model_and_tokenizer(
             ckpt_paths,
@@ -66,6 +68,7 @@ class LLM:
         self.template_config = template_config
         self.max_len = max_len
         self.device = device
+        self.prefix_cache = prefix_cache
 
         self.batched = batched
         if self.batched and self.model.params.attention_impl in [
@@ -75,8 +78,8 @@ class LLM:
             print("[warning] batched generation not supported for flash/flex attention, switching to sdpa")
             self.model.params.attention_impl = AttentionImpl.SDPA
 
-        if self.template_config is not None:
-            eos_ids = self.template_config.assistant_end
+        if self.template_config is not None and self.template_config.stop_token_ids:
+            eos_ids = self.template_config.stop_token_ids
 
         if eos_ids is None:
             eos_ids = [self.tokenizer.eos_token_id]
@@ -111,10 +114,12 @@ class LLM:
         role_ids: Optional[torch.Tensor] = None,
         temperature: float = 0.0,
         max_new_tokens: Optional[int] = None,
-    ) -> str:
+        return_token_ids: bool = False,
+    ):
         input_ids = input_ids.view(1, -1)
+        prompt_len = input_ids.shape[1]
 
-        max_new_tokens_ = self.max_len - input_ids.shape[1]
+        max_new_tokens_ = self.max_len - prompt_len
         if max_new_tokens:
             max_new_tokens_ = min(max_new_tokens_, max_new_tokens)
 
@@ -129,7 +134,41 @@ class LLM:
         else:
             asst_role = None
 
-        cache = self.model.init_cache(1, self.device)
+        max_cache_len = prompt_len + max_new_tokens_
+        cache = self.model.init_cache(1, self.device, max_cache_len=max_cache_len)
+
+        # --- Prefix cache lookup -------------------------------------------
+        # If a RadixKVCache is attached, reuse the longest matching prefix so
+        # we skip re-prefilling tokens we've already computed KV for. Always
+        # leave at least ONE token to prefill so we can sample the next token
+        # from fresh logits.
+        prompt_tokens = input_ids.flatten().tolist()
+        prefill_start = 0
+        if self.prefix_cache is not None:
+            match = self.prefix_cache.lookup(prompt_tokens)
+            if match.hit:
+                # Leave 1 token for prefill so the forward produces logits.
+                prefill_start = min(match.length, prompt_len - 1)
+                if prefill_start > 0:
+                    block = match.materialize()
+                    # We only want the first `prefill_start` tokens of the
+                    # matched block, in case match.length > prefill_start.
+                    if block.length > prefill_start:
+                        block = block.slice(0, prefill_start)
+                    cache.load_block(block, row_idx=0, at_pos=0)
+
+        # Prefill the remaining suffix.
+        suffix_ids = input_ids[:, prefill_start:]
+        suffix_roles = (
+            role_ids[:, prefill_start:] if role_ids is not None else None
+        )
+        logits, cache = self.model(
+            input_ids=suffix_ids,
+            role_ids=suffix_roles,
+            cache=cache,
+            logits_to_keep=1,
+        )
+        cur_token, _ = inference.utils.sample(logits, temperature=temperature)
 
         new_tokens = torch.full(
             (max_new_tokens_,),
@@ -137,20 +176,16 @@ class LLM:
             dtype=torch.int64,
             device=self.device,
         )
-
-        logits, cache = self.model(
-            input_ids=input_ids,
-            role_ids=role_ids,
-            cache=cache,
-            logits_to_keep=1,
-        )
-        cur_token, _ = inference.utils.sample(logits, temperature=temperature)
-
         new_tokens[0] = cur_token.squeeze()
 
-        if cur_token.squeeze().tolist() == self.eos_ids:
-            return ""
+        generated_token_ids: List[int] = [int(cur_token.squeeze().item())]
 
+        if generated_token_ids == self.eos_ids:
+            response = ""
+            self._insert_prefix_cache(cache, prompt_tokens + generated_token_ids)
+            return response
+
+        i = 0
         for i in range(1, max_new_tokens_):
             logits, cache = self.model(
                 input_ids=cur_token.view(1, -1),
@@ -161,12 +196,13 @@ class LLM:
             cur_token, _ = inference.utils.sample(logits, temperature=temperature)
 
             new_tokens[i] = cur_token.squeeze()
+            generated_token_ids.append(int(cur_token.squeeze().item()))
 
             last_tokens = new_tokens[i + 1 - len(self.eos_ids) : i + 1].tolist()
             if last_tokens == self.eos_ids:
                 break
 
-        new_tokens = new_tokens[: i + 1].tolist()
+        new_tokens_list = new_tokens[: i + 1].tolist()
 
         if i == max_new_tokens_ - 1:
             if max_new_tokens_ == max_new_tokens:
@@ -174,8 +210,27 @@ class LLM:
             else:
                 print("[warning] max_len reached")
 
-        response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        # --- Prefix cache insert -------------------------------------------
+        # Stash the full (prompt + generated) KV so the next turn can reuse
+        # this prefix.
+        self._insert_prefix_cache(cache, prompt_tokens + generated_token_ids)
+
+        response = self.tokenizer.decode(new_tokens_list, skip_special_tokens=True)
+        if return_token_ids:
+            return response, new_tokens_list
         return response
+
+    def _insert_prefix_cache(self, cache, full_tokens: List[int]) -> None:
+        if self.prefix_cache is None:
+            return
+        # The arena's seen_tokens[0] is the authoritative count of real KV
+        # positions written. Should equal len(full_tokens) after a normal
+        # prefill+decode loop.
+        length = cache.seen_tokens[0]
+        if length <= 0:
+            return
+        block = cache.extract_block(row_idx=0, length=length)
+        self.prefix_cache.insert(full_tokens[:length], block)
 
     def generate_unbatched(
         self,

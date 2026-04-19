@@ -38,7 +38,7 @@ from pydantic import BaseModel
 
 from torchllms.messages import Role
 from torchllms.models import utils
-from torchllms.models.cache import DecodingCache
+from torchllms.models.cache import LinearKVCache
 
 
 class AttentionImpl(Enum):
@@ -416,7 +416,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         role_ids: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[DecodingCache] = None,
+        cache: Optional[LinearKVCache] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
@@ -510,7 +510,7 @@ class TransformerBlock(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[DecodingCache] = None,
+        cache: Optional[LinearKVCache] = None,
     ):
         h = x + self.attention(
             x=self.attention_norm(x),
@@ -576,7 +576,7 @@ class Transformer(nn.Module):
     def init_cache(
         self, max_batch_size: int, device: str, max_cache_len: Optional[int] = None
     ):
-        return DecodingCache(
+        return LinearKVCache(
             self.params.n_layers,
             max_batch_size,
             max_cache_len or self.params.max_seq_len,
@@ -605,7 +605,7 @@ class Transformer(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[DecodingCache] = None,
+        cache: Optional[LinearKVCache] = None,
         logits_to_keep: Optional[int] = None,
     ):
         """

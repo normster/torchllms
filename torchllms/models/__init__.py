@@ -1,5 +1,5 @@
 from . import checkpoint_converter, lora, networks, utils
-from .cache import DecodingCache
+from .cache import KVBlock, LinearKVCache
 from .utils import (
     init_meta_params,
     load_model_weights,
@@ -7,7 +7,8 @@ from .utils import (
 
 __all__ = [
     "checkpoint_converter",
-    "DecodingCache",
+    "KVBlock",
+    "LinearKVCache",
     "init_meta_params",
     "load_model_weights",
     "lora",

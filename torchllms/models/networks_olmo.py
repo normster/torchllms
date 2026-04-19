@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from torchllms.models.cache import DecodingCache
+from torchllms.models.cache import LinearKVCache
 from torchllms.models.networks import (
     AttentionImpl,
     FeedForward,
@@ -60,7 +60,7 @@ class OLMo2Attention(nn.Module):
         x: torch.Tensor,
         role_ids: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[DecodingCache] = None,
+        cache: Optional[LinearKVCache] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
@@ -135,7 +135,7 @@ class OLMo2TransformerBlock(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[DecodingCache] = None,
+        cache: Optional[LinearKVCache] = None,
     ):
         h = x + self.attention_norm(
             self.attention(
