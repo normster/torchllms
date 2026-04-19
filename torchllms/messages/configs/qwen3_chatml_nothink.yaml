@@ -1,0 +1,48 @@
+# Qwen3 ChatML, nothink variant. Only generation_prompt_suffix differs from
+# qwen3_chatml.yaml — at generation time the assistant envelope is pre-filled
+# with an empty <think>\n\n</think>\n\n so the model skips reasoning.
+#
+# Byte-parity with tokenizer.apply_chat_template(..., enable_thinking=False).
+
+strip_whitespace: false
+strip_reasoning_from_prior_turns: true
+inject_empty_reasoning_for_last_turn: true
+generation_prompt_suffix: "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+# <|im_end|> and <|endoftext|> terminate assistant turns.
+stop_token_ids: [151645, 151643]
+
+roles:
+  system:
+    envelope_start: "<|im_start|>system\n"
+    envelope_end:   "<|im_end|>\n"
+
+  user:
+    envelope_start: "<|im_start|>user\n"
+    envelope_end:   "<|im_end|>\n"
+
+  assistant:
+    envelope_start: "<|im_start|>assistant\n"
+    envelope_end:   "<|im_end|>\n"
+
+  reasoning:
+    envelope_start: "<|im_start|>assistant\n"
+    envelope_end:   "<|im_end|>\n"
+    inner_start:    "<think>\n"
+    inner_end:      "\n</think>\n\n"
+    merge_with:     [tool_call, assistant]
+
+  tool_call:
+    envelope_start: "<|im_start|>assistant\n"
+    envelope_end:   "<|im_end|>\n"
+    inner_start:    "<tool_call>\n"
+    inner_end:      "\n</tool_call>"
+    merge_separator: "\n"
+    merge_with:     [tool_call, assistant]
+
+  tool:
+    envelope_start: "<|im_start|>user\n"
+    envelope_end:   "<|im_end|>\n"
+    inner_start:    "<tool_response>\n"
+    inner_end:      "\n</tool_response>"
+    merge_separator: "\n"
+    merge_with:     [tool]

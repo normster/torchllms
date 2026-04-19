@@ -1,0 +1,57 @@
+# Qwen3 ChatML template (thinking + nothink share this config; caller picks
+# the generation-prompt suffix via a flag on the loader).
+#
+# Byte-parity with tokenizer.apply_chat_template(..., enable_thinking=True).
+# Differences for nothink mode: only the generation prompt suffix changes
+# (see qwen3_chatml_nothink.yaml).
+
+strip_whitespace: false
+strip_reasoning_from_prior_turns: true
+inject_empty_reasoning_for_last_turn: true
+generation_prompt_suffix: "<|im_start|>assistant\n"
+# <|im_end|> and <|endoftext|> terminate assistant turns.
+stop_token_ids: [151645, 151643]
+
+roles:
+  system:
+    envelope_start: "<|im_start|>system\n"
+    envelope_end:   "<|im_end|>\n"
+
+  user:
+    envelope_start: "<|im_start|>user\n"
+    envelope_end:   "<|im_end|>\n"
+
+  assistant:
+    envelope_start: "<|im_start|>assistant\n"
+    envelope_end:   "<|im_end|>\n"
+
+  # Reasoning opens the assistant envelope (shared with any following
+  # tool_call / assistant fragments via merge_with). inner_start/end wrap
+  # the reasoning text as <think>\n...\n</think>\n\n.
+  reasoning:
+    envelope_start: "<|im_start|>assistant\n"
+    envelope_end:   "<|im_end|>\n"
+    inner_start:    "<think>\n"
+    inner_end:      "\n</think>\n\n"
+    merge_with:     [tool_call, assistant]
+
+  # Each tool_call wraps its JSON payload as <tool_call>\n{...}\n</tool_call>.
+  # Consecutive tool_calls inside one assistant envelope are separated by \n.
+  tool_call:
+    envelope_start: "<|im_start|>assistant\n"
+    envelope_end:   "<|im_end|>\n"
+    inner_start:    "<tool_call>\n"
+    inner_end:      "\n</tool_call>"
+    merge_separator: "\n"
+    merge_with:     [tool_call, assistant]
+
+  # Tool responses live inside a user envelope, each wrapped in
+  # <tool_response>\n...\n</tool_response>. Consecutive tool responses are
+  # separated by \n within the same user envelope.
+  tool:
+    envelope_start: "<|im_start|>user\n"
+    envelope_end:   "<|im_end|>\n"
+    inner_start:    "<tool_response>\n"
+    inner_end:      "\n</tool_response>"
+    merge_separator: "\n"
+    merge_with:     [tool]

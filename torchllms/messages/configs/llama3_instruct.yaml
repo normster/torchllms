@@ -1,19 +1,32 @@
-# This config implements a template similar to the JSON-based calling template introduced in Llama 3.1:
+# Llama 3 / Llama 3.1 instruct template.
+# Reference:
 # https://www.llama.com/docs/model-cards-and-prompt-formats/llama3_1/#json-based-tool-calling
+#
+# Strings throughout; encoded at tokenize time. Special tokens
+# (<|begin_of_text|>, <|start_header_id|>, <|end_header_id|>, <|eot_id|>,
+# <|eom_id|>) resolve to single added-token IDs.
 
-# <|begin_of_text|>
-bos: [128000]                                  
-# '<|start_header_id|>system<|end_header_id|>\n\n'
-system_start: [128006, 9125, 128007, 271]
-system_end: [128009]
-# '<|start_header_id|>user<|end_header_id|>\n\n'
-user_start: [128006, 882, 128007, 271]
-user_end: [128009]
-# '<|start_header_id|>assistant<|end_header_id|>\n\n'
-assistant_start: [128006, 78191, 128007, 271]
-assistant_end: [128009]
-# '<|start_header_id|>ipython<|end_header_id|>\n\n'
-tool_start: [128006, 23799, 4690, 128007, 271]
-tool_end: [128009]
-
+bos: "<|begin_of_text|>"
 strip_whitespace: true
+strip_reasoning_from_prior_turns: false
+inject_empty_reasoning_for_last_turn: false
+generation_prompt_suffix: "<|start_header_id|>assistant<|end_header_id|>\n\n"
+# <|eot_id|> is the turn terminator.
+stop_token_ids: [128009]
+
+roles:
+  system:
+    envelope_start: "<|start_header_id|>system<|end_header_id|>\n\n"
+    envelope_end:   "<|eot_id|>"
+
+  user:
+    envelope_start: "<|start_header_id|>user<|end_header_id|>\n\n"
+    envelope_end:   "<|eot_id|>"
+
+  assistant:
+    envelope_start: "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    envelope_end:   "<|eot_id|>"
+
+  tool:
+    envelope_start: "<|start_header_id|>ipython<|end_header_id|>\n\n"
+    envelope_end:   "<|eot_id|>"

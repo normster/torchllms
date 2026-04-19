@@ -1,18 +1,28 @@
-# This config implements a template similar to the JSON-based calling template introduced in Llama 3.1:
-# https://www.llama.com/docs/model-cards-and-prompt-formats/llama3_1/#json-based-tool-calling
-
-bos: []                                  
-# '<|im_start|>system<|im_start|>\n\n'
-system_start: [151644, 8948, 151644, 271]
-system_end: [151645]
-# '<|im_start|>user<|im_start|>\n\n'
-user_start: [151644, 872, 151644, 271]
-user_end: [151645]
-# '<|im_start|>assistant<|im_start|>\n\n'
-assistant_start: [151644, 77091, 151644, 271]
-assistant_end: [151645]
-# '<|im_start|>ipython<|im_start|>\n\n'
-tool_start: [151644, 22947, 4587, 151644, 271]
-tool_end: [151645]
+# Qwen 2.5 instruct template (no reasoning, no structured tool calls).
+# For Qwen3 with <think>/<tool_call>/<tool_response>, use qwen3_chatml.yaml
+# or qwen3_chatml_nothink.yaml instead.
 
 strip_whitespace: true
+strip_reasoning_from_prior_turns: false
+inject_empty_reasoning_for_last_turn: false
+generation_prompt_suffix: "<|im_start|>assistant\n"
+# <|im_end|> and <|endoftext|> both terminate assistant turns.
+stop_token_ids: [151645, 151643]
+
+roles:
+  system:
+    envelope_start: "<|im_start|>system\n"
+    envelope_end:   "<|im_end|>\n"
+
+  user:
+    envelope_start: "<|im_start|>user\n"
+    envelope_end:   "<|im_end|>\n"
+
+  assistant:
+    envelope_start: "<|im_start|>assistant\n"
+    envelope_end:   "<|im_end|>\n"
+
+  # Qwen 2.5 renders tool messages as role="ipython" (Llama-style).
+  tool:
+    envelope_start: "<|im_start|>ipython\n"
+    envelope_end:   "<|im_end|>\n"

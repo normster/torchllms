@@ -1,14 +1,30 @@
-# <|endoftext|>
-bos: [100257]      
-# '<|system|>\n'
-system_start: [27, 91, 9125, 91, 397]
-system_end: [100257]
-# '<|user|>\n'
-user_start: [27, 91, 882, 91, 397]
-user_end: [100257]
-# '<|assistant|>\n'
-assistant_start: [27, 91, 78191, 91, 397]
-assistant_end: [100257]
-# '<|tool|>\n'
-tool_start: [27, 91, 14506, 91, 397]
-tool_end: [100257]
+# OLMo2 instruct template.
+#
+# Uses `<|system|>`, `<|user|>`, `<|assistant|>`, `<|tool|>` as plain text
+# (NOT as single-token specials in the OLMo tokenizer); encoding them as
+# strings produces the correct multi-token sequences.
+
+bos: "<|endoftext|>"
+strip_whitespace: true
+strip_reasoning_from_prior_turns: false
+inject_empty_reasoning_for_last_turn: false
+generation_prompt_suffix: "<|assistant|>\n"
+# <|endoftext|> terminates the assistant turn.
+stop_token_ids: [100257]
+
+roles:
+  system:
+    envelope_start: "<|system|>\n"
+    envelope_end:   "<|endoftext|>"
+
+  user:
+    envelope_start: "<|user|>\n"
+    envelope_end:   "<|endoftext|>"
+
+  assistant:
+    envelope_start: "<|assistant|>\n"
+    envelope_end:   "<|endoftext|>"
+
+  tool:
+    envelope_start: "<|tool|>\n"
+    envelope_end:   "<|endoftext|>"
