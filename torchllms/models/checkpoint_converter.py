@@ -79,7 +79,14 @@ def maybe_safe_load(file):
 
 
 def _from_hf(
-    checkpoint, n_heads, n_kv_heads, dim, precision, head_dim=None, olmo2_arch=False
+    checkpoint,
+    n_heads,
+    n_kv_heads,
+    dim,
+    precision,
+    head_dim=None,
+    olmo2_arch=False,
+    qk_norm_per_head=False,
 ):
     if head_dim is None:
         head_dim = dim // n_heads
@@ -99,6 +106,20 @@ def _from_hf(
                 .transpose(1, 2)
                 .reshape(head_dim * n_head)
             )
+
+    def permute_head_dim(w):
+        """Permute a (head_dim,) tensor to match torchllms' RoPE ordering.
+
+        HF stores head_dim as [first_half | second_half]; torchllms's RoPE
+        expects interleaved pairs. Same logic as `permute` but without the
+        head dimension — used for Qwen3's per-head-dim q_norm/k_norm.
+        """
+        return (
+            w.view(2, head_dim // 2)
+            .transpose(0, 1)
+            .reshape(head_dim)
+            .contiguous()
+        )
 
     weight_map = {
         "model.embed_tokens.weight": "tok_embeddings.weight",
@@ -123,6 +144,12 @@ def _from_hf(
         weight_map |= {
             "model.layers.{}.post_attention_layernorm.weight": "layers.{}.attention_norm.weight",
             "model.layers.{}.post_feedforward_layernorm.weight": "layers.{}.ffn_norm.weight",
+            "model.layers.{}.self_attn.q_norm.weight": "layers.{}.attention.q_norm.weight",
+            "model.layers.{}.self_attn.k_norm.weight": "layers.{}.attention.k_norm.weight",
+        }
+    elif qk_norm_per_head:
+        # Qwen3-style per-head QK-norm (head_dim-shaped weights).
+        weight_map |= {
             "model.layers.{}.self_attn.q_norm.weight": "layers.{}.attention.q_norm.weight",
             "model.layers.{}.self_attn.k_norm.weight": "layers.{}.attention.k_norm.weight",
         }
@@ -153,8 +180,14 @@ def _from_hf(
         if "q_norm" in key:
             q_norm = final_result[key]
             k_norm = final_result[key.replace("q_norm", "k_norm")]
-            final_result[key] = permute(q_norm, n_heads)
-            final_result[key.replace("q_norm", "k_norm")] = permute(k_norm, n_kv_heads)
+            if qk_norm_per_head:
+                # (head_dim,) shape — permute along head_dim only.
+                final_result[key] = permute_head_dim(q_norm)
+                final_result[key.replace("q_norm", "k_norm")] = permute_head_dim(k_norm)
+            else:
+                # OLMo2 per-layer norm: (n_heads * head_dim,) shape.
+                final_result[key] = permute(q_norm, n_heads)
+                final_result[key.replace("q_norm", "k_norm")] = permute(k_norm, n_kv_heads)
 
     return final_result
 
@@ -287,6 +320,12 @@ def convert_from_hf_checkpoint(checkpoint: Path, output_dir: Path, precision: st
         state_dict = maybe_safe_load(str(file))
         merged_result.update(state_dict)
 
+    arch = config["architectures"][0].lower()
+    is_olmo2 = "olmo2" in arch
+    # Qwen3 has per-head-dim q_norm/k_norm applied after projection reshape
+    # (distinct from OLMo2's per-layer pre-reshape norm).
+    is_qwen3 = "qwen3" in arch or config.get("model_type", "").lower() == "qwen3"
+
     final_result = _from_hf(
         merged_result,
         n_heads=config["num_attention_heads"],
@@ -294,7 +333,8 @@ def convert_from_hf_checkpoint(checkpoint: Path, output_dir: Path, precision: st
         dim=config["hidden_size"],
         precision=precision,
         head_dim=config.get("head_dim", None),
-        olmo2_arch="olmo2" in config["architectures"][0].lower(),
+        olmo2_arch=is_olmo2,
+        qk_norm_per_head=is_qwen3,
     )
 
     output_dir = output_dir or checkpoint_dir
@@ -327,7 +367,16 @@ def convert_from_hf_checkpoint(checkpoint: Path, output_dir: Path, precision: st
             "ffn_dim_multiplier": config["intermediate_size"] / config["hidden_size"],
             "n_layers": config["num_hidden_layers"],
             "vocab_size": config["vocab_size"],
-            "attn_proj_bias": "qwen" in config["architectures"][0].lower(),
+            # Prefer the explicit HF config flag; fall back to the "qwen"
+            # architecture-name heuristic for older configs (Qwen2.5) which
+            # have bias but don't set attention_bias.
+            "attn_proj_bias": config.get(
+                "attention_bias",
+                (
+                    "qwen" in arch
+                    and not is_qwen3  # Qwen3 has no QKV bias
+                ),
+            ),
             "tie_word_embeddings": config.get("tie_word_embeddings", False),
         }
         if head_dim := config.get("head_dim", None):
@@ -338,8 +387,10 @@ def convert_from_hf_checkpoint(checkpoint: Path, output_dir: Path, precision: st
             _config["norm_eps"] = norm_eps
         if rope_theta := config.get("rope_theta", None):
             _config["rope_theta"] = rope_theta
-        if "olmo2" in config["architectures"][0].lower():
+        if is_olmo2:
             _config["olmo2_arch"] = True
+        if is_qwen3:
+            _config["qk_norm_per_head"] = True
 
         print("\nSaving model config:")
         pprint.pprint(_config)

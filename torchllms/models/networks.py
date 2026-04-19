@@ -66,6 +66,11 @@ class ModelParams(BaseModel):
     role_embeddings_init: str = "zeros"
     olmo2_arch: bool = False
     gpt_oss_arch: bool = False
+    # Qwen3-style per-head QK-norm: RMSNorm(head_dim) applied to xq/xk after
+    # the .view() reshape into (..., n_heads, head_dim) and before RoPE. Norm
+    # weights broadcast across heads. Different from OLMo2's pre-reshape
+    # per-layer QK-norm (handled via networks_olmo.py).
+    qk_norm_per_head: bool = False
     attention_impl: AttentionImpl = AttentionImpl.FLASH
 
     # gpt-oss MoE parameters
@@ -411,6 +416,14 @@ class Attention(nn.Module):
             bias=False,
         )
 
+        if params.qk_norm_per_head:
+            # Qwen3-style: RMSNorm(head_dim) applied per-head after reshape.
+            self.q_norm = RMSNorm(params.head_dim, eps=params.norm_eps)
+            self.k_norm = RMSNorm(params.head_dim, eps=params.norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -425,6 +438,10 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.params.n_heads, self.params.head_dim)
         xk = xk.view(bsz, seqlen, self.params.n_kv_heads, self.params.head_dim)
         xv = xv.view(bsz, seqlen, self.params.n_kv_heads, self.params.head_dim)
+
+        if self.q_norm is not None:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
 
         xq = self.rope(xq, input_pos=input_pos)
         xk = self.rope(xk, input_pos=input_pos)
@@ -455,6 +472,10 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.params.n_heads, self.params.head_dim)
         xk = xk.view(bsz, seqlen, self.params.n_kv_heads, self.params.head_dim)
         xv = xv.view(bsz, seqlen, self.params.n_kv_heads, self.params.head_dim)
+
+        if self.q_norm is not None:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
 
         xq = self.rope(xq, input_pos=input_pos)
         xk = self.rope(xk, input_pos=input_pos)
