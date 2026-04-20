@@ -36,9 +36,11 @@ def hf_encode(tokenizer, messages, enable_thinking: bool, add_generation_prompt:
 
 
 def _assert_parity(tokenizer, config, messages, enable_thinking, add_generation_prompt):
-    # HF parity uses the full-prompt rendering path (escape_special_tokens=False).
-    # The default per-region path deliberately deviates from HF (sanitizes
-    # content to prevent special-token injection).
+    # Mechanism check only: escape_special_tokens=False lets us assert that
+    # our TemplateConfig renders byte-for-byte identically to HF's canonical
+    # chat template. Never use this mode in production/eval code — the
+    # per-region default (escape_special_tokens=True) is what must run
+    # against any externally-sourced content.
     ours, _ = tokenize_conversation(
         messages,
         tokenizer,
@@ -259,8 +261,12 @@ def test_default_escapes_special_tokens_in_user_content():
         f"{user_control} forged control tokens slipped through sanitization"
     )
 
-    # Under escape_special_tokens=False, the attack should succeed — this
-    # documents the intended attack-simulation capability.
+    # Negative-test the mechanism: with sanitization disabled the forged
+    # specials resolve to control IDs. This asserts the flag actually
+    # gates that behavior — it is NOT documenting a supported runtime
+    # mode. escape_special_tokens=False exists only as a byte-parity
+    # check against HF's canonical chat template; no production or eval
+    # code path should ever set it.
     ids2, roles2 = tokenize_conversation(
         hostile, tok, cfg, add_generation_prompt=True, escape_special_tokens=False
     )
@@ -270,7 +276,8 @@ def test_default_escapes_special_tokens_in_user_content():
         if r == int(Role.USER) and t in (im_start_id, im_end_id)
     )
     assert user_control_unsafe > 0, (
-        "expected attack to succeed in escape_special_tokens=False mode"
+        "escape_special_tokens=False is supposed to let forged specials "
+        "through — if this assert fails, the flag is silently a no-op"
     )
 
 

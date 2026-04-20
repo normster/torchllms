@@ -31,34 +31,12 @@ HF `apply_chat_template` byte-for-byte. role_ids are assigned by mapping each
 token's character offset back to the region that produced it.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from string import Formatter
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field
 from transformers import PreTrainedTokenizerBase
-
-
-_FORMATTER = Formatter()
-
-
-def _is_templated(s: str) -> bool:
-    """True if s contains at least one `{name}`-style placeholder.
-
-    Uses `string.Formatter().parse()` rather than a `"{" in s` heuristic, so
-    `"literal {{braces}} text"` correctly reports False, and malformed
-    template strings surface early at load time.
-    """
-    if not s:
-        return False
-    return any(field is not None for _, field, _, _ in _FORMATTER.parse(s))
-
-
-def _maybe_format(s: str, metadata: Dict[str, Any]) -> str:
-    if not _is_templated(s):
-        return s
-    return s.format(**metadata)
 
 
 class Role(Enum):
@@ -196,16 +174,10 @@ class TemplateConfig(BaseModel):
 
 @dataclass
 class _Fragment:
-    """One flat rendering unit: a role name and its content string.
-
-    `metadata` carries per-fragment values that envelope/inner templates may
-    interpolate, e.g. `{"name": "bash"}` for tool_call / tool fragments so
-    Harmony-style `to=functions.{name}` headers resolve correctly.
-    """
+    """One flat rendering unit: a role name and its content string."""
 
     role_name: str
     content: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 def _render_tool_call_payload(call: Dict[str, Any]) -> str:
@@ -242,10 +214,6 @@ def _split_assistant_message(
     one fragment per tool_call, then a trailing assistant fragment carrying
     `content`. The trailing assistant fragment is skipped when both content
     is empty and at least one other fragment exists.
-
-    tool_call fragments carry `metadata={"name": fn_name, "arguments": ...}`
-    so envelope/inner templates can interpolate `{name}` (Harmony's
-    `to=functions.{name}`, Gemma 4's `call:{name}`, etc).
     """
     fragments: List[_Fragment] = []
 
@@ -256,44 +224,12 @@ def _split_assistant_message(
         fragments.append(_Fragment("reasoning", ""))
 
     for call in msg.get("tool_calls") or []:
-        fn = call.get("function", call)
-        metadata = {
-            "name": fn.get("name", ""),
-            "arguments": fn.get("arguments", ""),
-        }
-        fragments.append(
-            _Fragment(
-                "tool_call",
-                _render_tool_call_payload(call),
-                metadata=metadata,
-            )
-        )
+        fragments.append(_Fragment("tool_call", _render_tool_call_payload(call)))
 
     content = msg.get("content")
     if content or not fragments:
         fragments.append(_Fragment("assistant", content or ""))
     return fragments
-
-
-def _build_tool_name_lookup(conversation: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Map tool_call_id → function name across the conversation.
-
-    Chat Completions tool messages correlate back to the assistant's
-    tool_calls via `tool_call_id`. Harmony's `from=functions.{name}` and
-    Gemma 4's `response:{name}` in tool-response envelopes need the function
-    name, which this lookup supplies.
-    """
-    out: Dict[str, str] = {}
-    for msg in conversation:
-        if msg.get("role") != "assistant":
-            continue
-        for call in msg.get("tool_calls") or []:
-            call_id = call.get("id")
-            if not call_id:
-                continue
-            fn = call.get("function", call)
-            out[call_id] = fn.get("name", "")
-    return out
 
 
 def _expand_messages(
@@ -302,7 +238,6 @@ def _expand_messages(
     inject_empty_reasoning_for_last_turn: bool,
 ) -> List[_Fragment]:
     """Flatten a Chat Completions conversation into a list of _Fragment."""
-    tool_name_by_id = _build_tool_name_lookup(conversation)
     out: List[_Fragment] = []
     n = len(conversation)
     for i, msg in enumerate(conversation):
@@ -313,20 +248,6 @@ def _expand_messages(
             is_last = i == n - 1
             inject = inject_empty_reasoning_for_last_turn and is_last
             out.extend(_split_assistant_message(msg, inject_empty_reasoning=inject))
-        elif role == "tool":
-            # Resolve the tool's function name. Prefer an explicit `name`
-            # on the message, fall back to the tool_call_id lookup, else
-            # empty string (config may not reference `{name}` at all).
-            tname = msg.get("name")
-            if not tname:
-                tname = tool_name_by_id.get(msg.get("tool_call_id", ""), "")
-            out.append(
-                _Fragment(
-                    role,
-                    msg.get("content") or "",
-                    metadata={"name": tname},
-                )
-            )
         elif role in ROLE_NAMES:
             out.append(_Fragment(role, msg.get("content") or ""))
         else:
@@ -372,18 +293,25 @@ def tokenize_conversation(
     Two rendering modes:
 
     - Default (escape_special_tokens=True): **per-region encoding**. Message
-      content is encoded with `split_special_tokens=True` so user-supplied
-      content cannot forge template/control tokens (e.g., `<|im_start|>`
-      embedded in a user message will NOT resolve to its single control
-      token ID; it's broken into regular text tokens). BPE merges do NOT
-      cross content/template boundaries.
+      content is encoded with `split_special_tokens=True` so user-, tool-,
+      or any other externally-sourced content cannot forge template/control
+      tokens (e.g., `<|im_start|>` embedded in a user message will NOT
+      resolve to its single control token ID; it's broken into regular text
+      tokens). This is the only safe configuration for any real deployment
+      — sanitizing untrusted input is a baseline security requirement, not
+      an optional hardening. It has one side effect: BPE merges do not
+      cross content/template boundaries, so some inputs tokenize a few
+      tokens differently than HF `apply_chat_template` would (e.g., a
+      trailing `\\n` in envelope_start followed by a leading `\\n` in
+      content stays as two `\\n` tokens instead of one `\\n\\n` token).
 
     - escape_special_tokens=False: full-prompt encoded in one shot with
       return_offsets_mapping for role_ids. Matches HF's
-      `tokenizer.apply_chat_template` byte-for-byte — useful for validating
-      a TemplateConfig mirrors the canonical template, and for attack-
-      simulation experiments where we explicitly want user content to be
-      able to inject template tokens. **Not safe for production.**
+      `tokenizer.apply_chat_template` byte-for-byte. Exists **only** as a
+      mechanism check to verify that a TemplateConfig mirrors the canonical
+      HF template — never use this in production or in evaluations that
+      consume externally-sourced content. It lets content forge template
+      tokens, which is what a correct real system would sanitize away.
 
     Args:
         conversation: list of Chat Completions message dicts, or a single
@@ -391,7 +319,7 @@ def tokenize_conversation(
         tokenizer: HF PreTrainedTokenizerBase.
         config: TemplateConfig loaded from YAML or constructed directly.
         add_generation_prompt: if True, append the generation-prompt suffix.
-        escape_special_tokens: see above. Default True (production-safe).
+        escape_special_tokens: see above. Always True in production/eval.
 
     Returns:
         (input_ids, role_ids) with identical lengths. role_ids are ints:
@@ -472,21 +400,20 @@ def _render_per_region(
     for frag, rc, content_role_id, merged_from_prev, merged_to_next in _iter_fragments(
         fragments, config
     ):
-        md = frag.metadata
         if not merged_from_prev:
-            emit(enc_template(_maybe_format(rc.envelope_start, md)), NO_ROLE)
-        emit(enc_template(_maybe_format(rc.inner_start, md)), NO_ROLE)
+            emit(enc_template(rc.envelope_start), NO_ROLE)
+        emit(enc_template(rc.inner_start), NO_ROLE)
 
         content = frag.content
         if config.strip_whitespace:
             content = content.strip()
         emit(enc_content(content), content_role_id)
 
-        emit(enc_template(_maybe_format(rc.inner_end, md)), NO_ROLE)
+        emit(enc_template(rc.inner_end), NO_ROLE)
         if merged_to_next:
-            emit(enc_template(_maybe_format(rc.merge_separator, md)), NO_ROLE)
+            emit(enc_template(rc.merge_separator), NO_ROLE)
         else:
-            emit(enc_template(_maybe_format(rc.envelope_end, md)), NO_ROLE)
+            emit(enc_template(rc.envelope_end), NO_ROLE)
 
     if add_generation_prompt:
         emit(enc_template(config.generation_prompt_suffix), NO_ROLE)
@@ -530,21 +457,20 @@ def _render_full_prompt(
     for frag, rc, content_role_id, merged_from_prev, merged_to_next in _iter_fragments(
         fragments, config
     ):
-        md = frag.metadata
         if not merged_from_prev:
-            emit_text(_maybe_format(rc.envelope_start, md))
-        emit_text(_maybe_format(rc.inner_start, md))
+            emit_text(rc.envelope_start)
+        emit_text(rc.inner_start)
 
         content = frag.content
         if config.strip_whitespace:
             content = content.strip()
         emit_content(content, content_role_id)
 
-        emit_text(_maybe_format(rc.inner_end, md))
+        emit_text(rc.inner_end)
         if merged_to_next:
-            emit_text(_maybe_format(rc.merge_separator, md))
+            emit_text(rc.merge_separator)
         else:
-            emit_text(_maybe_format(rc.envelope_end, md))
+            emit_text(rc.envelope_end)
 
     if add_generation_prompt:
         emit_text(config.generation_prompt_suffix)
