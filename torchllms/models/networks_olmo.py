@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from torchllms.models.cache import LinearKVCache
+from torchllms.models.cache import KVArena
 from torchllms.models.networks import (
     AttentionImpl,
     FeedForward,
@@ -60,7 +60,7 @@ class OLMo2Attention(nn.Module):
         x: torch.Tensor,
         role_ids: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[LinearKVCache] = None,
+        cache: Optional[KVArena] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
@@ -135,8 +135,14 @@ class OLMo2TransformerBlock(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[LinearKVCache] = None,
+        cache: Optional[KVArena] = None,
+        use_kvcache_attn: bool = False,
     ):
+        # OLMo2's attention doesn't support use_kvcache_attn yet; the flag
+        # is accepted for signature parity with the base Transformer block
+        # but ignored. Callers needing divergent-length decode on OLMo2
+        # must use _generate_single or route through SDPA/eager.
+        del use_kvcache_attn
         h = x + self.attention_norm(
             self.attention(
                 x,

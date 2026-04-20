@@ -1,27 +1,50 @@
 """Across-call token-prefix KV cache for multi-turn rollouts.
 
 A compressed radix trie over token sequences. Each non-root node stores a
-KVBlock covering just the tokens on its inbound edge (delta storage), so a
+KVChunk covering just the tokens on its inbound edge (delta storage), so a
 shared system prompt across many rollouts is stored exactly once.
 
-Materializing a matched prefix concatenates all block tensors along the path
-from root to the matched node. Partial-edge matches (query ends mid-edge)
-slice the final block at read time without mutating the tree.
+Materializing a matched prefix concatenates all chunks along the path from
+root to the matched node. Partial-edge matches (query ends mid-edge) slice
+the final chunk at read time without mutating the tree.
 
 LRU eviction drops leaves in last-access order until total size fits the
 max_bytes budget. When a leaf's removal leaves its parent with a single
 remaining child, the parent and child are compacted into one node
-(concatenating edge tokens and blocks) so the tree always represents the
+(concatenating edge tokens and chunks) so the tree always represents the
 minimum set of branching points.
 
 Caveats for agentic rollout use:
   - Inserts are expected at turn boundaries, i.e., the full `tokens` and
-    KVBlock of the prefix computed so far (prompt + generated response).
+    KVChunk of the prefix computed so far (prompt + generated response).
   - The cache is not touched during a single generate() call. Lookup happens
     at turn start, insert at turn end; decode interacts only with the
-    LinearKVCache arena in between.
-  - CPU residency. Callers handle host<->device transfer when loading /
-    extracting blocks from a LinearKVCache.
+    KVArena in between.
+  - CPU residency. KVArena handles host<->device transfer via load_chunk
+    and extract_chunk / retire.
+
+Correctness caveat — bf16 matmul shape dependence:
+  A generate() call that hits a prefix (prefill qlen=1 against loaded
+  K of length N-1) produces numerically slightly different logits than
+  the same call without a cache (prefill qlen=N). The chunk round-trip
+  is bit-exact; SDPA is bit-exact. The root cause is cuBLAS GEMM in
+  bf16: nn.Linear(x[B, S1, D]) vs nn.Linear(x[B, S2, D]) give different
+  values at shared positions when S1 != S2, because cuBLAS selects
+  different kernels/tilings per M dimension and bf16 accumulation order
+  differs across kernels. Direct test on a 2560x2560 bf16 Linear:
+  max output diff ~1.0 at the first 32 rows between calls of shape
+  [1,33,2560] vs [1,32,2560] on identical data.
+  Compounded over 36 transformer layers, this reaches max logit diffs
+  of ~0.3-10 on Qwen3-4B at the last prefill position — enough to flip
+  argmax on close candidates and cascade into different greedy
+  trajectories. This is NOT unique to the radix path: calling
+  model.forward twice (prompt[:K] then prompt[K:]) diverges from a
+  single forward on the full prompt by the same order of magnitude.
+  Also not fixable without giving up batched matmul or moving attention
+  layers to fp32.
+  Phase 5 intervention comparisons should hold the regime fixed (both
+  baseline and intervention use the same cache state) so the drift
+  cancels.
 """
 
 from __future__ import annotations
@@ -29,7 +52,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterator, List, Optional, Sequence, Tuple
 
-from torchllms.models.cache import KVBlock
+from torchllms.models.cache import KVChunk
 
 
 def _common_prefix_len(a: Sequence[int], b: Sequence[int]) -> int:
@@ -50,7 +73,7 @@ class _Node:
     """
 
     edge_tokens: Tuple[int, ...]
-    block: Optional[KVBlock]
+    block: Optional[KVChunk]
     children: dict = field(default_factory=dict)
     parent: Optional["_Node"] = None
     last_access: int = 0
@@ -74,8 +97,8 @@ class RadixMatch:
     def hit(self) -> bool:
         return self.length > 0
 
-    def materialize(self) -> KVBlock:
-        """Return the KVBlock covering the matched prefix.
+    def materialize(self) -> KVChunk:
+        """Return the KVChunk covering the matched prefix.
 
         Walks from root to the final path node, concatenating each node's
         delta block. If the match ended mid-edge, the final block is sliced
@@ -83,7 +106,7 @@ class RadixMatch:
         """
         if not self._path:
             raise ValueError("RadixMatch has no match to materialize")
-        blocks: List[KVBlock] = [n.block for n in self._path[:-1]]
+        blocks: List[KVChunk] = [n.block for n in self._path[:-1]]
         last = self._path[-1]
         if self._last_edge_consumed < len(last.edge_tokens):
             blocks.append(last.block.slice(0, self._last_edge_consumed))
@@ -91,24 +114,25 @@ class RadixMatch:
             blocks.append(last.block)
         if len(blocks) == 1:
             return blocks[0]
-        return KVBlock.concat(blocks)
+        return KVChunk.concat(blocks)
 
 
 class RadixKVCache:
-    """Compressed radix trie indexing delta KVBlocks by token prefix.
+    """Compressed radix trie indexing delta KVChunks by token prefix.
 
     See module docstring for design notes.
 
     Usage:
         cache = RadixKVCache(max_bytes=16 * 1024**3)
+        rid = arena.claim()
         match = cache.lookup(tokens)
         if match.hit:
-            block = match.materialize()
-            arena.load_block(block, at_pos=0)
+            chunk = match.materialize()
+            arena.load_chunk(chunk, rid)
             prefill_tokens = tokens[match.length:]
         # ... run generation, collect full_tokens = tokens + generated ...
-        full_block = arena.extract_block(length=len(full_tokens))
-        cache.insert(full_tokens, full_block)
+        full_chunk = arena.retire(rid)
+        cache.insert(full_tokens, full_chunk)
     """
 
     def __init__(self, max_bytes: int):
@@ -166,8 +190,8 @@ class RadixKVCache:
             _last_edge_consumed=len(last.edge_tokens),
         )
 
-    def insert(self, tokens: Sequence[int], block: KVBlock) -> None:
-        """Insert a full-prefix KVBlock for the given tokens.
+    def insert(self, tokens: Sequence[int], block: KVChunk) -> None:
+        """Insert a full-prefix KVChunk for the given tokens.
 
         The block must cover exactly `tokens` (block.length == len(tokens)).
         Internally, the radix trie is extended via one of:
@@ -193,7 +217,7 @@ class RadixKVCache:
         self,
         node: _Node,
         tokens: Tuple[int, ...],
-        block: KVBlock,
+        block: KVChunk,
         matched: int,
     ) -> None:
         while matched < len(tokens):
@@ -229,7 +253,7 @@ class RadixKVCache:
         self,
         node: _Node,
         new_tokens: Tuple[int, ...],
-        block: KVBlock,
+        block: KVChunk,
         matched: int,
     ) -> None:
         """Attach a new child edge, or if `node` is a childless non-root leaf,
@@ -238,7 +262,7 @@ class RadixKVCache:
         if node is not self._root and not node.children:
             # Leaf extension: concat tokens and blocks in place.
             old_block = node.block
-            new_block = KVBlock.concat([old_block, delta])
+            new_block = KVChunk.concat([old_block, delta])
             self._total_bytes -= old_block.size_bytes
             self._total_bytes += new_block.size_bytes
             node.edge_tokens = node.edge_tokens + new_tokens
@@ -329,7 +353,7 @@ class RadixKVCache:
         if parent is not self._root and len(parent.children) == 1:
             only_child = next(iter(parent.children.values()))
             merged_tokens = parent.edge_tokens + only_child.edge_tokens
-            merged_block = KVBlock.concat([parent.block, only_child.block])
+            merged_block = KVChunk.concat([parent.block, only_child.block])
             self._total_bytes -= parent.block.size_bytes + only_child.block.size_bytes
             self._total_bytes += merged_block.size_bytes
             parent.edge_tokens = merged_tokens

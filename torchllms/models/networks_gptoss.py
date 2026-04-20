@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from torchllms.models.attention_gptoss import attention as triton_attention
 from torchllms.models.attention_gptoss import attention_ref
-from torchllms.models.cache import LinearKVCache
+from torchllms.models.cache import KVArena
 from torchllms.models.networks import (
     ModelParams,
     RMSNorm,
@@ -198,7 +198,7 @@ class GptOSSAttention(nn.Module):
         x: torch.Tensor,
         role_ids: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[LinearKVCache] = None,
+        cache: Optional[KVArena] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
@@ -217,11 +217,14 @@ class GptOSSAttention(nn.Module):
         q = self.rope(q, input_pos=input_pos)
         k = self.rope(k, input_pos=input_pos)
 
-        # Compute start_q for the attention kernel (position of first query token)
+        # Compute start_q for the attention kernel (position of first query
+        # token). The triton kernel asserts len(start_q) == 1, so this is a
+        # single scalar shared across batch rows — callers with diverging
+        # per-row positions must not use the fused kernel path.
         if input_pos is not None:
-            start_q = input_pos[:, 0:1].to(torch.long)
+            start_q = input_pos[:1, 0].to(torch.long)
         elif cache is not None:
-            start_q = cache.next_start_pos[:1].to(torch.long)
+            start_q = cache.row_positions[:1].to(torch.long)
         else:
             start_q = torch.zeros(1, dtype=torch.long, device=x.device)
 
@@ -457,8 +460,13 @@ class GptOSSTransformerBlock(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[LinearKVCache] = None,
+        cache: Optional[KVArena] = None,
+        use_kvcache_attn: bool = False,
     ):
+        # GptOSS uses a custom triton attention kernel that doesn't yet
+        # support per-row diverging cache lengths via flash_attn_with_kvcache.
+        # The flag is accepted for signature parity with the base block.
+        del use_kvcache_attn
         x = x + self.attn(x, role_ids, input_pos, cache, attn_mask)
         x = self.mlp(x)
         return x
@@ -497,7 +505,7 @@ class GptOSSTransformer(nn.Module):
     def init_cache(
         self, max_batch_size: int, device: str, max_cache_len: Optional[int] = None
     ):
-        return LinearKVCache(
+        return KVArena(
             self.params.n_layers,
             max_batch_size,
             max_cache_len or self.params.max_seq_len,
@@ -525,16 +533,20 @@ class GptOSSTransformer(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[LinearKVCache] = None,
+        cache: Optional[KVArena] = None,
         logits_to_keep: Optional[int] = None,
+        use_kvcache_attn: bool = False,
     ):
+        # use_kvcache_attn is accepted for signature parity with the base
+        # Transformer; GptOSS blocks ignore it (custom triton attention).
+        del use_kvcache_attn
         assert (
             cache is None or not cache.is_full()
         ), "Maximum sequence length reached, KV cache is full"
 
         if input_pos is None and cache is not None:
             input_pos = torch.arange(input_ids.shape[1])[None, :]
-            input_pos = input_pos.to(input_ids.device) + cache.next_start_pos[:, None]
+            input_pos = input_pos.to(input_ids.device) + cache.row_positions[:, None]
 
         h = self.tok_embeddings(input_ids)
 
@@ -544,7 +556,6 @@ class GptOSSTransformer(nn.Module):
         if cache is not None:
             role_ids = cache.update_role_ids(role_ids)
             attn_mask = cache.update_attn_mask(attn_mask)
-            cache.next_start_pos = input_pos[:, -1] + 1
 
         for layer in self.layers:
             h = layer(h, role_ids, attn_mask, input_pos, cache)

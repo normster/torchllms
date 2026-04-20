@@ -17,6 +17,7 @@ from torchllms import inference
 from torchllms.inference.prefix_cache import RadixKVCache
 from torchllms.messages import tokenization
 from torchllms.models import utils
+from torchllms.models.cache import RolloutId
 from torchllms.models.networks import AttentionImpl
 
 
@@ -163,6 +164,7 @@ class LLM:
 
         max_cache_len = prompt_len + max_new_tokens_
         cache = self.model.init_cache(1, self.device, max_cache_len=max_cache_len)
+        rid = cache.claim()
 
         # --- Prefix cache lookup -------------------------------------------
         # If a RadixKVCache is attached, reuse the longest matching prefix so
@@ -177,12 +179,12 @@ class LLM:
                 # Leave 1 token for prefill so the forward produces logits.
                 prefill_start = min(match.length, prompt_len - 1)
                 if prefill_start > 0:
-                    block = match.materialize()
+                    chunk = match.materialize()
                     # We only want the first `prefill_start` tokens of the
-                    # matched block, in case match.length > prefill_start.
-                    if block.length > prefill_start:
-                        block = block.slice(0, prefill_start)
-                    cache.load_block(block, row_idx=0, at_pos=0)
+                    # matched chunk, in case match.length > prefill_start.
+                    if chunk.length > prefill_start:
+                        chunk = chunk.slice(0, prefill_start)
+                    cache.load_chunk(chunk, rid)
 
         # Prefill the remaining suffix.
         suffix_ids = input_ids[:, prefill_start:]
@@ -227,7 +229,7 @@ class LLM:
         # --- Prefix cache insert -------------------------------------------
         # Stash the full (prompt + generated) KV so the next turn can reuse
         # this prefix.
-        self._insert_prefix_cache(cache, prompt_tokens + generated_token_ids)
+        self._insert_prefix_cache(cache, rid, prompt_tokens + generated_token_ids)
 
         text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
         return GenerationResult(
@@ -236,17 +238,18 @@ class LLM:
             stop_reason=stop_reason,
         )
 
-    def _insert_prefix_cache(self, cache, full_tokens: List[int]) -> None:
+    def _insert_prefix_cache(self, cache, rid, full_tokens: List[int]) -> None:
         if self.prefix_cache is None:
             return
-        # The arena's seen_tokens[0] is the authoritative count of real KV
-        # positions written. Should equal len(full_tokens) after a normal
-        # prefill+decode loop.
-        length = cache.seen_tokens[0]
+        # row_positions[slot] is the authoritative count of real KV positions
+        # written for this rollout. Should equal len(full_tokens) after a
+        # normal prefill+decode loop.
+        slot = cache.resolve(rid)
+        length = int(cache.row_positions[slot].item())
         if length <= 0:
             return
-        block = cache.extract_block(row_idx=0, length=length)
-        self.prefix_cache.insert(full_tokens[:length], block)
+        chunk = cache.extract_chunk(rid, length=length)
+        self.prefix_cache.insert(full_tokens[:length], chunk)
 
     def generate_unbatched(
         self,
@@ -256,7 +259,7 @@ class LLM:
         max_new_tokens: Optional[int] = None,
         disable_tqdm: bool = False,
         **kwargs,
-    ) -> List[str]:
+    ) -> List[GenerationResult]:
         """Generate responses for multiple prompts or conversations.
 
         Args:
@@ -316,169 +319,307 @@ class LLM:
 
         return responses
 
-    def _collate(self, inputs, pad="left"):
-        batch_size = len(inputs)
-        prompt_len = [len(e) for e in inputs]
-        max_len = max(prompt_len)
-        padded = torch.zeros(batch_size, max_len, dtype=torch.int64, device=self.device)
-        attention_mask = torch.zeros(
-            batch_size, max_len, dtype=torch.bool, device=self.device
-        )
-        input_pos = torch.zeros(
-            batch_size, max_len, dtype=torch.int64, device=self.device
-        )
-        for i, p in enumerate(prompt_len):
-            input_pos[i, -p:] = torch.arange(p, device=self.device)
-
-        for i, e in enumerate(inputs):
-            if pad == "left":
-                padded[i, -len(e) :] = torch.tensor(e, device=self.device)
-                attention_mask[i, -len(e) :] = True
-            else:
-                padded[i, : len(e)] = torch.tensor(e, device=self.device)
-                attention_mask[i, : len(e)] = True
-
-        return padded, attention_mask, input_pos
-
     @torch.inference_mode()
     def _generate_multiple(
         self,
-        input_ids: List[torch.Tensor],
-        role_ids: Optional[List[torch.Tensor]] = None,
+        input_ids: List,
+        role_ids: Optional[List] = None,
         temperature: float = 0.0,
         max_new_tokens: Optional[int] = None,
-    ) -> List[str]:
-        input_ids, attn_mask, input_pos = self._collate(input_ids)
-        if role_ids is not None:
-            role_ids, _, _ = self._collate(role_ids)
+    ) -> List[GenerationResult]:
+        """Batched decode. Returns one ``GenerationResult`` per input, in
+        the original order.
 
-        batch_size = input_ids.shape[0]
-        prompt_len = attn_mask.sum(dim=1)
-        max_new_tokens_t = torch.minimum(
-            torch.tensor(max_new_tokens or self.max_len), self.max_len - prompt_len
-        )
-        max_max_new_tokens = max_new_tokens_t.max().item()
-        max_prompt_len = prompt_len.max().item()
-        max_cache_len = max_max_new_tokens + max_prompt_len
+        Prefill strategy:
+          Rows are grouped by ``(prefill_start, prompt_len)`` where
+          ``prefill_start`` is the per-row radix match length (0 if no
+          ``prefix_cache`` or no hit). One batched forward per group.
+          - Single group (all rows share shape) → batched prefill writes
+            directly into the main arena. Fast path, no chunk copies.
+          - Multiple groups → per-group temp arena, extract final chunks,
+            load into the main arena.
 
-        eos_ids = torch.tensor(self.eos_ids, device=self.device)
+        Decode:
+          - Uniform prompt lengths across all rows → fast
+            ``flash_attn_func`` path.
+          - Diverging prompt lengths → ``flash_attn_with_kvcache`` (FA2
+            kernel that masks each row to its own cache_seqlen).
 
-        if role_ids is not None:
-            # all generated tokens should be assistant tokens
-            asst_role = int(tokenization.Role.ASSISTANT)
-            asst_role = torch.tensor([[asst_role]] * batch_size, device=self.device)
-        else:
-            asst_role = None
+        Semantics:
+          - Any-of stop: generation for a row stops on the first sampled
+            token in ``self.eos_set``.
+          - Per-row retirement via ``retire_many`` at the end of each
+            decode step. Swap-with-last compaction keeps ``b_live`` tight
+            on subsequent forwards without disturbing ``RolloutId`` mappings
+            for surviving rows.
+          - ``prefix_cache.insert`` runs on each retired row's extracted
+            chunk using ``prompt_tokens[i] + generated[rid][:-1]`` as the
+            key (same convention as ``_generate_single``).
+          - ``prefix_cache.lookup`` runs once per row at the start.
+        """
+        B = len(input_ids)
+        if B == 0:
+            return []
 
-        cache = self.model.init_cache(
-            max_batch_size=batch_size,
-            device=self.device,
-            max_cache_len=max_cache_len,
-        )
+        def _as_list(x) -> List[int]:
+            if isinstance(x, torch.Tensor):
+                return x.flatten().tolist()
+            return list(x)
 
-        new_tokens = torch.full(
-            size=(batch_size, max_max_new_tokens),
-            fill_value=-1,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        is_completed = torch.full(
-            size=(batch_size,),
-            fill_value=False,
-            dtype=torch.bool,
-            device=self.device,
-        )
-        eos_idxs = torch.full(
-            size=(batch_size,),
-            fill_value=max_max_new_tokens,
-            dtype=torch.int64,
-            device=self.device,
+        prompt_token_lists = [_as_list(x) for x in input_ids]
+        role_id_lists: Optional[List[List[int]]] = (
+            [_as_list(x) for x in role_ids] if role_ids is not None else None
         )
 
-        logits, cache = self.model(
-            input_ids=input_ids,
-            role_ids=role_ids,
-            cache=cache,
-            attn_mask=attn_mask,
-            input_pos=input_pos,
-            logits_to_keep=1,
+        prompt_lens = [len(p) for p in prompt_token_lists]
+        if role_id_lists is not None:
+            for i, r in enumerate(role_id_lists):
+                if len(r) != prompt_lens[i]:
+                    raise ValueError(
+                        f"role_ids[{i}] length {len(r)} != prompt length {prompt_lens[i]}"
+                    )
+
+        max_prompt_len = max(prompt_lens)
+        uniform_lens = len(set(prompt_lens)) == 1
+
+        # Per-row budget: each row can generate up to its own max_new_tokens
+        # (clamped by max_len - prompt_len[i]).
+        budgets = []
+        for plen in prompt_lens:
+            b = self.max_len - plen
+            if max_new_tokens is not None:
+                b = min(b, max_new_tokens)
+            budgets.append(max(0, b))
+        max_budget = max(budgets)
+        if max_budget < 1:
+            return [GenerationResult("", [], None) for _ in range(B)]
+
+        # Per-row prefix-cache lookup. Leave ≥1 suffix token per row so the
+        # prefill forward produces fresh logits for the first sample.
+        prefill_starts = [0] * B
+        prefix_chunks: List[Optional[object]] = [None] * B
+        if self.prefix_cache is not None:
+            for i, prompt in enumerate(prompt_token_lists):
+                match = self.prefix_cache.lookup(prompt)
+                if match.hit:
+                    ps = min(match.length, prompt_lens[i] - 1)
+                    if ps > 0:
+                        chunk = match.materialize()
+                        if chunk.length > ps:
+                            chunk = chunk.slice(0, ps)
+                        prefill_starts[i] = ps
+                        prefix_chunks[i] = chunk
+
+        max_cache_len = max_prompt_len + max_budget
+        cache = self.model.init_cache(B, self.device, max_cache_len=max_cache_len)
+
+        rids: List[RolloutId] = [cache.claim() for _ in range(B)]
+        origin_of: Dict[RolloutId, int] = {rid: i for i, rid in enumerate(rids)}
+        generated: Dict[RolloutId, List[int]] = {rid: [] for rid in rids}
+        stop_reasons: Dict[RolloutId, Optional[int]] = {rid: None for rid in rids}
+
+        def _retire_and_insert(to_retire: List[RolloutId]) -> None:
+            if not to_retire:
+                return
+            chunks = cache.retire_many(to_retire)
+            if self.prefix_cache is None:
+                return
+            for rid, chunk in zip(to_retire, chunks):
+                if chunk.length <= 0:
+                    continue
+                i = origin_of[rid]
+                gen = generated[rid]
+                total_tokens = prompt_token_lists[i] + gen[:-1]
+                self.prefix_cache.insert(total_tokens[: chunk.length], chunk)
+
+        # ---- Prefill ----
+        # Group by (prefill_start, prompt_len). Single-group runs directly
+        # on the main arena; multi-group uses temp arenas + chunk transfer.
+        first_tokens = self._prefill_grouped(
+            cache, rids, prompt_token_lists, role_id_lists,
+            prefill_starts, prefix_chunks, temperature,
         )
-        cur_tokens, _ = inference.utils.sample(logits, temperature=temperature)
 
-        new_tokens[:, 0] = cur_tokens
-        is_completed |= max_new_tokens_t <= 1
-        if len(eos_ids) == 1:
-            last_tokens = new_tokens[:, [0]]
-            is_completed |= torch.all(last_tokens == eos_ids, dim=1)
+        # Record first sampled token for every row; mark stops.
+        to_retire_now: List[RolloutId] = []
+        for rid, tok in zip(rids, first_tokens):
+            tok = int(tok)
+            generated[rid].append(tok)
+            if tok in self.eos_set:
+                stop_reasons[rid] = tok
+                to_retire_now.append(rid)
+            elif len(generated[rid]) >= budgets[origin_of[rid]]:
+                to_retire_now.append(rid)
+        _retire_and_insert(to_retire_now)
 
-        eos_idxs[is_completed] = torch.minimum(
-            eos_idxs[is_completed], torch.tensor(0, device=self.device)
-        )
+        # ---- Decode ----
+        # Under diverging-length prefill, rows end at per-row seen_tokens =
+        # prompt_lens[i], so decode must route through flash_attn_with_kvcache
+        # for correct per-row masking. Under uniform prompt_lens the fast
+        # flash_attn_func path is correct. Prefix-cache hits don't affect
+        # the decode regime — every row ends prefill at prompt_len[i]
+        # regardless of where it started.
+        decode_use_kvcache_attn = not uniform_lens
 
-        if is_completed.all():
-            return [""] * batch_size
+        asst_role_id = int(tokenization.Role.ASSISTANT)
+        for _step in range(1, max_budget):
+            if cache.b_live == 0:
+                break
+            active_rids = cache.active_rollouts()
+            next_input = torch.tensor(
+                [[generated[rid][-1]] for rid in active_rids],
+                dtype=torch.long, device=self.device,
+            )
+            next_roles = None
+            if role_id_lists is not None:
+                next_roles = torch.full(
+                    (cache.b_live, 1),
+                    asst_role_id,
+                    dtype=torch.long,
+                    device=self.device,
+                )
 
-        cache.evict(is_completed)  # len: B_active
-        cur_tokens = cur_tokens[~is_completed]
-        asst_role = asst_role[~is_completed] if asst_role is not None else None
-
-        for i in range(1, max_max_new_tokens):
-            active_mask = ~is_completed  # len: B_full
-
-            logits, cache = self.model(
-                input_ids=cur_tokens.unsqueeze(1),
-                role_ids=asst_role,
+            logits, _ = self.model(
+                input_ids=next_input,
+                role_ids=next_roles,
                 cache=cache,
                 logits_to_keep=1,
-            )  # len: B_active
-            cur_tokens, _ = inference.utils.sample(logits, temperature=temperature)
-
-            new_tokens[active_mask, i] = cur_tokens
-            is_completed |= (max_new_tokens_t <= i) | (
-                (prompt_len + i + 1) >= self.max_len
+                use_kvcache_attn=decode_use_kvcache_attn,
             )
-            if len(eos_ids) <= i + 1:
-                last_tokens = new_tokens[:, i + 1 - len(self.eos_ids) : i + 1]
-                is_completed |= torch.all(last_tokens == eos_ids, dim=1)
+            sampled, _ = inference.utils.sample(logits, temperature=temperature)
+            new_tokens = sampled.view(-1).tolist()
 
-            eos_idxs[is_completed] = torch.minimum(
-                eos_idxs[is_completed],
-                torch.tensor(i, device=self.device),
+            step_retires: List[RolloutId] = []
+            for rid, tok in zip(active_rids, new_tokens):
+                tok = int(tok)
+                generated[rid].append(tok)
+                if tok in self.eos_set:
+                    stop_reasons[rid] = tok
+                    step_retires.append(rid)
+                elif len(generated[rid]) >= budgets[origin_of[rid]]:
+                    step_retires.append(rid)
+            _retire_and_insert(step_retires)
+
+        if cache.b_live > 0:
+            _retire_and_insert(list(cache.active_rollouts()))
+
+        results: List[Optional[GenerationResult]] = [None] * B
+        for rid in rids:
+            i = origin_of[rid]
+            gen = generated[rid]
+            text = self.tokenizer.decode(gen, skip_special_tokens=True)
+            results[i] = GenerationResult(
+                text=text, token_ids=gen, stop_reason=stop_reasons[rid],
             )
+        return results  # type: ignore[return-value]
 
-            just_completed = is_completed[active_mask]  # len: B_active
-            cache.evict(just_completed)
-            cur_tokens = cur_tokens[~just_completed]
-            asst_role = asst_role[~just_completed] if asst_role is not None else None
+    def _prefill_grouped(
+        self,
+        cache,
+        rids: List[RolloutId],
+        prompt_token_lists: List[List[int]],
+        role_id_lists: Optional[List[List[int]]],
+        prefill_starts: List[int],
+        prefix_chunks: List[Optional[object]],
+        temperature: float,
+    ) -> List[int]:
+        """Group rows by ``(prefill_start, prompt_len)``. One batched
+        prefill per group.
 
-            if is_completed.all():
-                break
+        Single-group case (all rows share shape) writes directly to the
+        main arena: fastest path, no chunk copies. Multi-group case uses
+        a temp arena per group and copies final chunks into the main arena.
 
-        # move back to lists on CPU for easier processing
-        new_tokens = new_tokens.tolist()
-        is_completed = is_completed.tolist()
-        eos_idxs = eos_idxs.tolist()
+        Within each group, rows may have different radix matches (same
+        length but different tokens), so each row's chunk is loaded into
+        its own slot before the batched suffix forward.
 
-        new_tokens = [new_tokens[i][: eos_idxs[i]] for i in range(batch_size)]
+        Returns first-tokens in row order.
+        """
+        B = len(rids)
+        first_tokens: List[int] = [0] * B
 
-        token_limits, length_limits = 0, 0
-        for i in range(batch_size):
-            if eos_idxs[i] == max_new_tokens_t[i] - 1:
-                if max_new_tokens and max_new_tokens_t[i] == max_new_tokens:
-                    token_limits += 1
-                else:
-                    length_limits += 1
+        # Group rows by (prefill_start, prompt_len).
+        groups: Dict[tuple, List[int]] = {}
+        for i in range(B):
+            key = (prefill_starts[i], len(prompt_token_lists[i]))
+            groups.setdefault(key, []).append(i)
 
-        if token_limits > 0:
-            print(f"[warning] max_new_tokens reached {token_limits} times")
-        if length_limits > 0:
-            print(f"[warning] max_len reached {length_limits} times")
+        if len(groups) == 1:
+            # Fast path: one group matching the main arena.
+            prefill_start, _prompt_len = next(iter(groups))
+            for i, rid in enumerate(rids):
+                if prefix_chunks[i] is not None:
+                    cache.load_chunk(prefix_chunks[i], rid)
+            suffix_ids_list = [
+                prompt_token_lists[i][prefill_start:] for i in range(B)
+            ]
+            suffix_t = torch.tensor(
+                suffix_ids_list, dtype=torch.long, device=self.device,
+            )
+            roles_t = None
+            if role_id_lists is not None:
+                suffix_roles = [
+                    role_id_lists[i][prefill_start:] for i in range(B)
+                ]
+                roles_t = torch.tensor(
+                    suffix_roles, dtype=torch.long, device=self.device,
+                )
+            logits, _ = self.model(
+                input_ids=suffix_t,
+                role_ids=roles_t,
+                cache=cache,
+                logits_to_keep=1,
+            )
+            sampled, _ = inference.utils.sample(logits, temperature=temperature)
+            for i, tok in enumerate(sampled.view(-1).tolist()):
+                first_tokens[i] = int(tok)
+            return first_tokens
 
-        responses = [
-            self.tokenizer.decode(t, skip_special_tokens=True).strip()
-            for t in new_tokens
-        ]
-        return responses
+        # Multi-group: per-group temp arena, extract final chunks, load
+        # into the main arena.
+        for (prefill_start, prompt_len), indices in groups.items():
+            group_B = len(indices)
+            tmp = self.model.init_cache(
+                group_B, self.device, max_cache_len=prompt_len + 1,
+            )
+            tmp_rids = [tmp.claim() for _ in indices]
+            # Load each row's radix chunk into its temp-arena slot.
+            for idx_in_group, orig_i in enumerate(indices):
+                if prefix_chunks[orig_i] is not None:
+                    tmp.load_chunk(prefix_chunks[orig_i], tmp_rids[idx_in_group])
+
+            suffix_ids_list = [
+                prompt_token_lists[orig_i][prefill_start:] for orig_i in indices
+            ]
+            suffix_t = torch.tensor(
+                suffix_ids_list, dtype=torch.long, device=self.device,
+            )
+            roles_t = None
+            if role_id_lists is not None:
+                suffix_roles = [
+                    role_id_lists[orig_i][prefill_start:] for orig_i in indices
+                ]
+                roles_t = torch.tensor(
+                    suffix_roles, dtype=torch.long, device=self.device,
+                )
+            logits, _ = self.model(
+                input_ids=suffix_t,
+                role_ids=roles_t,
+                cache=tmp,
+                logits_to_keep=1,
+            )
+            sampled, _ = inference.utils.sample(logits, temperature=temperature)
+            group_first = sampled.view(-1).tolist()
+
+            for idx_in_group, orig_i in enumerate(indices):
+                first_tokens[orig_i] = int(group_first[idx_in_group])
+                chunk = tmp.extract_chunk(
+                    tmp_rids[idx_in_group], length=prompt_len,
+                )
+                cache.load_chunk(chunk, rids[orig_i])
+
+        return first_tokens
 
     def generate_batched(
         self,
@@ -489,7 +630,7 @@ class LLM:
         temperature: float = 0.0,
         disable_tqdm: bool = False,
         **kwargs,
-    ) -> List[str]:
+    ) -> List[GenerationResult]:
         """Generate responses for multiple prompts or conversations.
 
         Args:

@@ -26,10 +26,11 @@ from enum import Enum
 from typing import Optional
 
 try:
-    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache
 except ImportError:
     print("flash_attn not found, using native PyTorch implementation")
     flash_attn_func = None
+    flash_attn_with_kvcache = None
 
 import torch
 import torch.nn as nn
@@ -38,7 +39,7 @@ from pydantic import BaseModel
 
 from torchllms.messages import Role
 from torchllms.models import utils
-from torchllms.models.cache import LinearKVCache
+from torchllms.models.cache import KVArena
 
 
 class AttentionImpl(Enum):
@@ -346,6 +347,34 @@ def _flash_attention(xq: torch.Tensor, xk: torch.Tensor, xv: torch.Tensor):
     return output
 
 
+def _flash_attention_with_kvcache(
+    xq: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+):
+    """Decode against a KV cache with per-row valid lengths.
+
+    xq:          [B, qlen, n_heads, head_dim]
+    k_cache/v_cache: [B, max_seqlen, n_kv_heads, head_dim] — the ENTIRE
+        cache for this layer, including positions beyond each row's valid
+        end (those positions may be stale/zero).
+    cache_seqlens: int64 [B] — per-row number of valid positions in the
+        cache. Row i attends to k_cache[i, :cache_seqlens[i]].
+
+    Used for batched decode when rows have diverged prompt lengths or
+    post-retirement slot shifts. For uniform cache_seqlens plus qlen==1,
+    ``_flash_attention`` on ``k_cache[:, :seqlen]`` is equivalent and
+    slightly faster — callers should prefer that when possible.
+    """
+    bsz, qlen, n_heads, head_dim = xq.shape
+    dim = n_heads * head_dim
+    output = flash_attn_with_kvcache(
+        xq, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=True,
+    )
+    return output.reshape(bsz, qlen, dim)
+
+
 def _sdpa_attention(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -429,8 +458,9 @@ class Attention(nn.Module):
         x: torch.Tensor,
         role_ids: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[LinearKVCache] = None,
+        cache: Optional[KVArena] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        use_kvcache_attn: bool = False,
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -449,7 +479,17 @@ class Attention(nn.Module):
         if cache is not None:
             xk, xv = cache.update_kv(self.layer_id, xk, xv)
 
-        if self.params.attention_impl == AttentionImpl.FLASH:
+        if use_kvcache_attn:
+            # Per-row diverging cache lengths: route to flash_attn_with_kvcache.
+            # Requires flash_attn and a cache to read seen_tokens from.
+            assert cache is not None and flash_attn_with_kvcache is not None, (
+                "use_kvcache_attn requires a cache and flash_attn installed"
+            )
+            cache_seqlens = cache.seen_tokens[self.layer_id, : xq.shape[0]]
+            output = _flash_attention_with_kvcache(
+                xq, xk, xv, cache_seqlens.to(torch.int32),
+            )
+        elif self.params.attention_impl == AttentionImpl.FLASH:
             assert attn_mask is None
             output = _flash_attention(xq, xk, xv)
         elif self.params.attention_impl == AttentionImpl.SDPA:
@@ -531,7 +571,8 @@ class TransformerBlock(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[LinearKVCache] = None,
+        cache: Optional[KVArena] = None,
+        use_kvcache_attn: bool = False,
     ):
         h = x + self.attention(
             x=self.attention_norm(x),
@@ -539,6 +580,7 @@ class TransformerBlock(nn.Module):
             attn_mask=attn_mask,
             input_pos=input_pos,
             cache=cache,
+            use_kvcache_attn=use_kvcache_attn,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -597,7 +639,7 @@ class Transformer(nn.Module):
     def init_cache(
         self, max_batch_size: int, device: str, max_cache_len: Optional[int] = None
     ):
-        return LinearKVCache(
+        return KVArena(
             self.params.n_layers,
             max_batch_size,
             max_cache_len or self.params.max_seq_len,
@@ -626,8 +668,9 @@ class Transformer(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[LinearKVCache] = None,
+        cache: Optional[KVArena] = None,
         logits_to_keep: Optional[int] = None,
+        use_kvcache_attn: bool = False,
     ):
         """
         Apply a single forward pass for training or inference (prefill + decoding).
@@ -665,10 +708,11 @@ class Transformer(nn.Module):
             cache is None or not cache.is_full()
         ), "Maximum sequence length reached, KV cache is full"
 
-        # RoPE assumes [0, 1, 2, ...] input_pos when not provided
+        # RoPE assumes [0, 1, 2, ...] input_pos when not provided, offset by
+        # each row's current absolute position (derived from seen_tokens).
         if input_pos is None and cache is not None:
             input_pos = torch.arange(input_ids.shape[1])[None, :]
-            input_pos = input_pos.to(input_ids.device) + cache.next_start_pos[:, None]
+            input_pos = input_pos.to(input_ids.device) + cache.row_positions[:, None]
 
         h = self.tok_embeddings(input_ids)
 
@@ -678,10 +722,9 @@ class Transformer(nn.Module):
         if cache is not None:
             role_ids = cache.update_role_ids(role_ids)
             attn_mask = cache.update_attn_mask(attn_mask)
-            cache.next_start_pos = input_pos[:, -1] + 1
 
         for i, layer in enumerate(self.layers):
-            h = layer(h, role_ids, attn_mask, input_pos, cache)
+            h = layer(h, role_ids, attn_mask, input_pos, cache, use_kvcache_attn)
 
         if logits_to_keep is not None:
             h = h[:, -logits_to_keep:]

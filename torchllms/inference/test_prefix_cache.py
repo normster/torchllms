@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from torchllms.inference.prefix_cache import RadixKVCache, _Node
-from torchllms.models.cache import KVBlock
+from torchllms.models.cache import KVChunk
 
 
 N_LAYERS = 2
@@ -13,8 +13,8 @@ N_KV_HEADS = 2
 HEAD_DIM = 4
 
 
-def _mk_block(length: int, fill: float = 1.0, role_id: int = 1) -> KVBlock:
-    """Make a KVBlock with a recognizable fill pattern.
+def _mk_block(length: int, fill: float = 1.0, role_id: int = 1) -> KVChunk:
+    """Make a KVChunk with a recognizable fill pattern.
 
     The K tensor at position i contains `fill + i`, so concat/slice is
     verifiable by inspection. V = -K.
@@ -24,10 +24,10 @@ def _mk_block(length: int, fill: float = 1.0, role_id: int = 1) -> KVBlock:
     k = base + fill
     v = -k
     role_ids = torch.full((length,), role_id, dtype=torch.long)
-    return KVBlock(k=k, v=v, role_ids=role_ids)
+    return KVChunk(k=k, v=v, role_ids=role_ids)
 
 
-def _block_for_range(start: int, end: int, fill: float = 1.0, role_id: int = 1) -> KVBlock:
+def _block_for_range(start: int, end: int, fill: float = 1.0, role_id: int = 1) -> KVChunk:
     """Make a block whose per-position values encode absolute token positions.
 
     Useful when testing splits: each block is a slice of a virtual 'prefix
@@ -39,11 +39,11 @@ def _block_for_range(start: int, end: int, fill: float = 1.0, role_id: int = 1) 
     k = positions + fill
     v = -k
     role_ids = torch.full((length,), role_id, dtype=torch.long)
-    return KVBlock(k=k, v=v, role_ids=role_ids)
+    return KVChunk(k=k, v=v, role_ids=role_ids)
 
 
 # ------------------------------------------------------------------
-# KVBlock basics
+# KVChunk basics
 # ------------------------------------------------------------------
 
 
@@ -60,7 +60,7 @@ def test_kvblock_slice_and_concat_roundtrip():
     head = full.slice(0, 4)
     tail = full.slice(4, 10)
     assert head.length == 4 and tail.length == 6
-    rejoined = KVBlock.concat([head, tail])
+    rejoined = KVChunk.concat([head, tail])
     assert torch.equal(rejoined.k, full.k)
     assert torch.equal(rejoined.v, full.v)
     assert torch.equal(rejoined.role_ids, full.role_ids)
@@ -100,7 +100,7 @@ def test_lookup_longer_than_stored_falls_back_to_prefix():
 
 def test_insert_empty_is_noop():
     c = RadixKVCache(max_bytes=1 << 30)
-    c.insert([], _mk_block(0) if False else KVBlock(
+    c.insert([], _mk_block(0) if False else KVChunk(
         k=torch.zeros(N_LAYERS, 0, N_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16),
         v=torch.zeros(N_LAYERS, 0, N_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16),
         role_ids=torch.zeros(0, dtype=torch.long),

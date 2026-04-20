@@ -13,7 +13,7 @@ import torch
 
 from torchllms.inference.llm import LLM
 from torchllms.inference.prefix_cache import RadixKVCache
-from torchllms.models.cache import LinearKVCache
+from torchllms.models.cache import KVArena
 
 
 VOCAB = 32
@@ -36,9 +36,9 @@ class FakeTransformer(torch.nn.Module):
 
     Semantics:
       - Embedding is identity-ish: token id at position p → K[p] = p, V[p] = -p
-        (same for all layers + heads). This makes KV blocks easy to verify.
+        (same for all layers + heads). This makes KV chunks easy to verify.
       - Forward writes deterministic K/V based on absolute position
-        (cache.seen_tokens[layer] + offset), via cache.update_kv.
+        (row_positions[0] at forward start + offset), via cache.update_kv.
       - Forward produces logits that are argmax=(last_pos + 1) % VOCAB, so
         greedy decode produces positions 1, 2, 3... regardless of input ids.
         That lets us compare cached vs uncached sample output by "position"
@@ -52,7 +52,7 @@ class FakeTransformer(torch.nn.Module):
         self.forward_calls: list[dict] = []
 
     def init_cache(self, max_batch_size: int, device: str, max_cache_len=None):
-        return LinearKVCache(
+        return KVArena(
             n_layers=self.params.n_layers,
             max_bsz=max_batch_size,
             max_seqlen=max_cache_len or self.params.max_seq_len,
@@ -70,40 +70,51 @@ class FakeTransformer(torch.nn.Module):
         logits_to_keep=None,
         attn_mask=None,
         input_pos=None,
+        use_kvcache_attn=False,
     ):
+        # The FakeTransformer doesn't actually do attention; it writes
+        # deterministic K/V and produces deterministic logits. The
+        # use_kvcache_attn flag is accepted for signature parity.
+        del use_kvcache_attn
         B, S = input_ids.shape
         self.forward_calls.append({"input_ids": input_ids.clone(), "seqlen": S})
 
         assert cache is not None, "FakeTransformer expects cache in tests"
+        assert cache.b_live == B, (
+            f"FakeTransformer: cache.b_live={cache.b_live} != input_ids.shape[0]={B}"
+        )
 
         cache.update_role_ids(role_ids)
         cache.update_attn_mask(attn_mask)
 
-        pos_start = cache.seen_tokens[0]
+        # Pre-update row_positions = per-row starting absolute position.
+        # Supports both uniform and diverging batched forward.
+        row_starts = cache.row_positions.clone()  # [B] on device
         device = input_ids.device
-        # K[p] = absolute position p, V[p] = -p (same across layers/heads).
-        positions = torch.arange(pos_start, pos_start + S, dtype=torch.bfloat16, device=device)
-        k_single = positions.view(1, S, 1, 1).expand(B, S, N_KV_HEADS, HEAD_DIM).contiguous()
+
+        # K[p] = absolute position p, V[p] = -p per row. Build a [B, S] matrix
+        # of absolute positions, one row per input sequence. Under diverging
+        # row_starts, each row's K values reflect its own position axis.
+        arange_s = torch.arange(S, dtype=torch.bfloat16, device=device)
+        abs_pos_bs = arange_s[None, :] + row_starts[:, None].to(torch.bfloat16)  # [B, S]
+        k_single = abs_pos_bs[:, :, None, None].expand(B, S, N_KV_HEADS, HEAD_DIM).contiguous()
         v_single = -k_single
 
         for layer_id in range(self.params.n_layers):
             cache.update_kv(layer_id, k_single, v_single)
 
-        cache.next_start_pos = torch.tensor(
-            [cache.seen_tokens[0]] * B, device=device, dtype=torch.long
-        )
-
-        # Logits: each position's argmax = (p + 1) % VOCAB. Greedy sampling
-        # from position p thus emits token (p+1).
-        end_pos = pos_start + S
+        # Logits: for each row, each output position's argmax = (abs_pos + 1) % VOCAB,
+        # where abs_pos depends on that row's own pos_start.
         out_len = logits_to_keep if logits_to_keep is not None else S
         logits = torch.full(
             (B, out_len, VOCAB), fill_value=-10.0, dtype=torch.bfloat16, device=device
         )
-        for i in range(out_len):
-            abs_pos = end_pos - out_len + i  # absolute position of this query token
-            tok = (abs_pos + 1) % VOCAB
-            logits[:, i, tok] = 10.0
+        for b in range(B):
+            end_pos_b = int(row_starts[b].item()) + S
+            for i in range(out_len):
+                abs_pos = end_pos_b - out_len + i
+                tok = (abs_pos + 1) % VOCAB
+                logits[b, i, tok] = 10.0
 
         return logits, cache
 
@@ -299,6 +310,138 @@ def test_multiple_alternatives_semantics():
     out = llm._generate_single(prompt, max_new_tokens=10)
     assert out.stop_reason == 6, f"got {out.stop_reason!r}"
     assert out.token_ids == [5, 6], f"got {out.token_ids!r}"
+
+
+# ------------------------------------------------------------------
+# _generate_multiple (batched) — v1 contract
+# ------------------------------------------------------------------
+
+
+def test_multi_uniform_prompts_match_single():
+    """Batched generation of B=4 identical prompts produces B identical
+    GenerationResults that each match the single-row call."""
+    model_s = FakeTransformer()
+    llm_s = _build_llm(model_s, prefix_cache=None, eos_ids=[0])
+    prompt = torch.tensor([[5, 6, 7, 8, 9]], dtype=torch.long)
+    single = llm_s._generate_single(prompt, max_new_tokens=4)
+
+    model_m = FakeTransformer()
+    llm_m = _build_llm(model_m, prefix_cache=None, eos_ids=[0])
+    inputs = [[5, 6, 7, 8, 9]] * 4
+    multi = llm_m._generate_multiple(inputs, max_new_tokens=4)
+    assert len(multi) == 4
+    for r in multi:
+        assert r.text == single.text, f"{r.text!r} != {single.text!r}"
+        assert r.token_ids == single.token_ids
+        assert r.stop_reason == single.stop_reason
+
+
+def test_multi_all_rows_stop_on_eos_simultaneously():
+    """FakeTransformer emits deterministic tokens (p+1)%VOCAB; same prompt
+    across rows means they stop at the same step. retire_many handles the
+    all-at-once retirement correctly."""
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None, eos_ids=[6])
+    inputs = [[5, 6, 7, 8, 9]] * 3
+    out = llm._generate_multiple(inputs, max_new_tokens=5)
+    assert len(out) == 3
+    for r in out:
+        assert r.stop_reason == 6, f"got {r.stop_reason!r}"
+        # Prompt length 5 → first sample at pos 4 = token 5; then pos 5 = 6.
+        assert r.token_ids == [5, 6], f"got {r.token_ids!r}"
+
+
+def test_multi_budget_exhausted_yields_stop_reason_none():
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None, eos_ids=[99])  # never hit
+    inputs = [[5, 6, 7, 8, 9]] * 2
+    out = llm._generate_multiple(inputs, max_new_tokens=3)
+    for r in out:
+        assert r.stop_reason is None
+        assert len(r.token_ids) == 3
+
+
+def test_multi_preserves_input_order():
+    """Even after swap-with-last compaction shuffles internal slot order,
+    the output list must be in the same order as `input_ids`."""
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None, eos_ids=[0])
+    # All rows same prompt → same outputs, but token_ids list should be
+    # present for each row at the correct index.
+    inputs = [[5, 6, 7, 8, 9]] * 4
+    out = llm._generate_multiple(inputs, max_new_tokens=2)
+    assert len(out) == 4
+    # Verify each result corresponds to its input index (not None).
+    assert all(r is not None for r in out)
+    # Uniform prompts produce uniform outputs; sanity check the values.
+    for r in out:
+        assert r.token_ids == [5, 6]
+
+
+def test_multi_diverging_prompt_lengths_prefill_per_row():
+    """Diverging prompt lengths should take the per-row prefill path and
+    still produce one GenerationResult per input in the original order."""
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None, eos_ids=[0])
+    inputs = [[5, 6, 7], [5, 6, 7, 8, 9]]
+    out = llm._generate_multiple(inputs, max_new_tokens=2)
+    assert len(out) == 2
+    # First prompt is length 3; first sampled token from position 2 = 3.
+    # Second prompt is length 5; first sampled token from position 4 = 5.
+    # Then each row does one more decode step (max_new_tokens=2).
+    assert out[0].token_ids == [3, 4], f"got {out[0].token_ids!r}"
+    assert out[1].token_ids == [5, 6], f"got {out[1].token_ids!r}"
+
+
+def test_multi_diverging_matches_per_row_single():
+    """Each row of a diverging-length batched call should produce the same
+    tokens as calling _generate_single on that row alone (using the same
+    FakeTransformer)."""
+    prompts = [[5, 6, 7], [5, 6, 7, 8, 9, 10], [5, 6]]
+
+    model_m = FakeTransformer()
+    llm_m = _build_llm(model_m, prefix_cache=None, eos_ids=[0])
+    multi = llm_m._generate_multiple(prompts, max_new_tokens=3)
+
+    for i, p in enumerate(prompts):
+        model_s = FakeTransformer()
+        llm_s = _build_llm(model_s, prefix_cache=None, eos_ids=[0])
+        single = llm_s._generate_single(
+            torch.tensor([p], dtype=torch.long), max_new_tokens=3,
+        )
+        assert multi[i].token_ids == single.token_ids, (
+            f"row {i}: multi={multi[i].token_ids!r} single={single.token_ids!r}"
+        )
+
+
+def test_multi_empty_input_returns_empty():
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None)
+    assert llm._generate_multiple([], max_new_tokens=2) == []
+
+
+def test_multi_inserts_into_prefix_cache_per_row():
+    """Each retired row should land in the radix cache as its own entry.
+    FakeTransformer produces the same tokens across rows, but we use
+    distinct prompts so each row inserts a distinct sequence."""
+    model = FakeTransformer()
+    radix = RadixKVCache(max_bytes=16 * 1024 ** 2)
+    llm = _build_llm(model, prefix_cache=radix, eos_ids=[0])
+    # Two rows with same-length but different prompts so they create
+    # separate radix entries. Uniform length still required by v1.
+    inputs = [[5, 6, 7, 8, 9], [10, 11, 12, 13, 14]]
+    out = llm._generate_multiple(inputs, max_new_tokens=3)
+    assert len(out) == 2
+    # Row 0: prompt [5,6,7,8,9], generated positions 5,6,7 → [5,6,7].
+    # Cached: prompt + generated[:-1] = [5,6,7,8,9,5,6], length 7.
+    m0 = radix.lookup([5, 6, 7, 8, 9, 5, 6])
+    assert m0.hit and m0.length == 7, f"row0 lookup length={m0.length}"
+    # Row 1: prompt [10,11,12,13,14]. FakeTransformer's logits depend on
+    # absolute position only, not on input token content; since both rows
+    # share prompt length (5), they generate the same tokens [5,6,7].
+    # Cached: prompt + generated[:-1] = [10,11,12,13,14,5,6], length 7.
+    m1 = radix.lookup([10, 11, 12, 13, 14, 5, 6])
+    assert m1.hit and m1.length == 7, f"row1 lookup length={m1.length}"
 
 
 if __name__ == "__main__":
