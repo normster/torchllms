@@ -6,14 +6,25 @@ and intervention pipelines. Delegates rendering to the openai-harmony SDK,
 then scans the token stream to assign role IDs.
 
 Role labels (torchllms `Role` enum):
-  - system / developer content → Role.SYSTEM
-  - user content               → Role.USER
-  - assistant final content    → Role.ASSISTANT
-  - assistant analysis channel → Role.REASONING
-  - assistant commentary calls → Role.TOOL_CALL   (tool-call argument JSON)
-  - tool-role content          → Role.TOOL
-  - all Harmony template bytes → Role.OTHER       (<|start|>, <|message|>,
-                                                   channel/role names, etc.)
+  - Harmony system block content → Role.OTHER (model-contract metadata:
+                                   identity, knowledge cutoff, reasoning
+                                   effort, channel declarations, builtin
+                                   tool namespaces)
+  - CC system / developer content → Role.SYSTEM (rendered into Harmony
+                                    DEVELOPER block as `# Instructions`
+                                    and/or `# Tools`)
+  - user content                 → Role.USER
+  - assistant final content      → Role.ASSISTANT
+  - assistant analysis channel   → Role.REASONING
+  - assistant commentary calls   → Role.TOOL_CALL (tool-call argument JSON)
+  - tool-role content            → Role.TOOL
+  - all Harmony template bytes   → Role.OTHER (<|start|>, <|message|>, etc.)
+
+A Harmony system block is always emitted (channel declarations matter).
+Each CC `system` / `developer` message becomes its own Harmony DEVELOPER
+block (one-to-one). Function-tool schemas are attached to the first such
+block, or emitted as a standalone DEVELOPER block if no CC
+system/developer message is present.
 
 One Chat Completions assistant message may carry `reasoning_content`,
 `tool_calls`, and `content` simultaneously. It expands into up to:
@@ -27,14 +38,18 @@ One Chat Completions assistant message may carry `reasoning_content`,
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from openai_harmony import (
     Author,
     Conversation,
+    DeveloperContent,
     HarmonyEncodingName,
     Message as HarmonyMessage,
+    ReasoningEffort,
     Role as HarmonyRole,
+    SystemContent,
+    ToolDescription,
     load_harmony_encoding,
 )
 
@@ -58,12 +73,22 @@ HARMONY_CALL = 200012       # <|call|>     (end-of-assistant-tool-call)
 _MESSAGE_END_TOKENS = (HARMONY_END, HARMONY_CALL, HARMONY_RETURN)
 
 
+# ---- Option validation sets ---------------------------------------------
+
+ALLOWED_REASONING_EFFORTS = frozenset({"low", "medium", "high"})
+ALLOWED_CHANNELS = frozenset({"analysis", "commentary", "final"})
+ALLOWED_BUILTIN_TOOLS = frozenset({"browser", "python"})
+
+
 # ---- Role / channel → Role enum mapping ---------------------------------
 
-# Decoded role-name → torchllms Role. Harmony's DEVELOPER carries what
-# Chat Completions calls "system" (the user-facing instructions).
+# Decoded role-name → torchllms Role. The Harmony SYSTEM block carries
+# model-contract scaffolding (channels, effort, dates) — not user-facing
+# instructions — so its content tokens map to Role.OTHER. The DEVELOPER
+# block carries what CC calls `system`/`developer` (instructions + tool
+# schemas), so those tokens map to Role.SYSTEM.
 HARMONY_ROLE_NAME_MAP: Dict[str, Role] = {
-    "system": Role.SYSTEM,
+    "system": Role.OTHER,
     "developer": Role.SYSTEM,
     "user": Role.USER,
     "assistant": Role.ASSISTANT,
@@ -84,33 +109,85 @@ def _get_encoding():
 
 # ---- Public API ---------------------------------------------------------
 
+CCToolDict = Dict[str, Any]
+
 
 def tokenize_harmony_conversation(
     conversation: List[Dict[str, Any]],
     tokenizer=None,  # noqa: ARG001 — kept for API parity with tokenize_conversation
     add_generation_prompt: bool = False,
+    *,
+    reasoning_effort: Optional[str] = "low",
+    valid_channels: Sequence[str] = ("analysis", "commentary", "final"),
+    current_date: Optional[str] = None,
+    knowledge_cutoff: Optional[str] = None,
+    system_identity: Optional[str] = None,
+    tools: Optional[Sequence[CCToolDict]] = None,
+    builtin_tools: Sequence[str] = (),
 ) -> Tuple[List[int], List[int]]:
     """Render a Chat Completions conversation as Harmony tokens + role IDs.
 
     Args:
-        conversation: list of Chat Completions message dicts. Assistant
-            messages may include `reasoning_content`, `content`, and
-            `tool_calls`. Tool messages may include `name` or `tool_call_id`
-            (which is resolved against earlier assistant tool_calls).
+        conversation: list of Chat Completions message dicts. `system` and
+            `developer` messages must appear at the start (any order) and
+            each becomes its own Harmony DEVELOPER block rendered as
+            `# Instructions`. Assistant messages may include
+            `reasoning_content`, `content`, and `tool_calls`. Tool messages
+            may include `name` or `tool_call_id` (resolved against earlier
+            assistant tool_calls).
         tokenizer: unused; kept so this function's signature mirrors
             `tokenize_conversation`.
         add_generation_prompt: if True, append the assistant-completion
             prefix so the result is ready to feed a generation.
+        reasoning_effort: one of "low"/"medium"/"high", or None to leave the
+            SDK default (MEDIUM). Populates the SYSTEM block's
+            `Reasoning: ...` line.
+        valid_channels: which Harmony channels to declare as valid. An
+            empty tuple suppresses the `# Valid channels: ...` line.
+        current_date: ISO date string for `Current date: ...`. None omits
+            the line (the SDK does not inject today's date).
+        knowledge_cutoff: ISO date / month for `Knowledge cutoff: ...`.
+            None leaves the SDK default (2024-06).
+        system_identity: override for the default
+            "You are ChatGPT..." identity string. None leaves the SDK
+            default.
+        tools: optional list of Chat Completions tool dicts. Each entry may
+            be in canonical `{"type": "function", "function": {...}}` form
+            or flat `{"name", "description", "parameters"}`. Attached to
+            the first DEVELOPER block (or a standalone DEVELOPER block if
+            the conversation has no CC system/developer messages).
+        builtin_tools: subset of {"browser", "python"}. Each flips on the
+            matching Harmony built-in tool in the SYSTEM block.
 
     Returns:
         (input_ids, role_ids) of equal length. See module docstring for the
         Role enum each content region carries.
     """
+    _validate_options(reasoning_effort, valid_channels, builtin_tools)
     enc = _get_encoding()
 
-    tool_name_by_id = _build_tool_name_lookup(conversation)
+    prefix_count = _count_prefix_messages(conversation)
+    prefix_msgs = conversation[:prefix_count]
+    tool_descs = _build_tool_descriptions(tools) if tools else []
+
     messages: List[HarmonyMessage] = []
-    for msg in conversation:
+    messages.append(
+        HarmonyMessage.from_role_and_content(
+            HarmonyRole.SYSTEM,
+            _build_system_content(
+                reasoning_effort=reasoning_effort,
+                valid_channels=valid_channels,
+                current_date=current_date,
+                knowledge_cutoff=knowledge_cutoff,
+                system_identity=system_identity,
+                builtin_tools=builtin_tools,
+            ),
+        )
+    )
+    messages.extend(_build_developer_messages(prefix_msgs, tool_descs))
+
+    tool_name_by_id = _build_tool_name_lookup(conversation)
+    for msg in conversation[prefix_count:]:
         messages.extend(_cc_to_harmony(msg, tool_name_by_id))
 
     convo = Conversation.from_messages(messages)
@@ -125,7 +202,139 @@ def tokenize_harmony_conversation(
     return input_ids, role_ids
 
 
-# ---- CC → Harmony conversion --------------------------------------------
+# ---- Option validation --------------------------------------------------
+
+
+def _validate_options(
+    reasoning_effort: Optional[str],
+    valid_channels: Sequence[str],
+    builtin_tools: Sequence[str],
+) -> None:
+    if reasoning_effort is not None and reasoning_effort not in ALLOWED_REASONING_EFFORTS:
+        raise ValueError(
+            f"reasoning_effort={reasoning_effort!r}; allowed: "
+            f"{sorted(ALLOWED_REASONING_EFFORTS)} or None"
+        )
+    bad_ch = set(valid_channels) - ALLOWED_CHANNELS
+    if bad_ch:
+        raise ValueError(
+            f"valid_channels contains unsupported names: {sorted(bad_ch)}; "
+            f"allowed: {sorted(ALLOWED_CHANNELS)}"
+        )
+    bad_bt = set(builtin_tools) - ALLOWED_BUILTIN_TOOLS
+    if bad_bt:
+        raise ValueError(
+            f"builtin_tools contains unsupported names: {sorted(bad_bt)}; "
+            f"allowed: {sorted(ALLOWED_BUILTIN_TOOLS)}"
+        )
+
+
+# ---- Prefix (system/developer) handling ---------------------------------
+
+
+def _count_prefix_messages(conversation: List[Dict[str, Any]]) -> int:
+    """Return N such that conversation[:N] are all system/developer.
+
+    Raises if system/developer appears later in the conversation.
+    """
+    n = 0
+    for msg in conversation:
+        if msg.get("role") in ("system", "developer"):
+            n += 1
+        else:
+            break
+    for msg in conversation[n:]:
+        if msg.get("role") in ("system", "developer"):
+            raise ValueError(
+                "system/developer messages must appear at the start of the "
+                "conversation (collapsed into a single Harmony DEVELOPER block)"
+            )
+    return n
+
+
+# ---- SystemContent / DeveloperContent builders --------------------------
+
+
+def _build_system_content(
+    *,
+    reasoning_effort: Optional[str],
+    valid_channels: Sequence[str],
+    current_date: Optional[str],
+    knowledge_cutoff: Optional[str],
+    system_identity: Optional[str],
+    builtin_tools: Sequence[str],
+) -> SystemContent:
+    sc = SystemContent.new()
+    if reasoning_effort is not None:
+        sc = sc.with_reasoning_effort(ReasoningEffort[reasoning_effort.upper()])
+    if valid_channels is not None:
+        sc = sc.with_required_channels(list(valid_channels))
+    if current_date is not None:
+        sc = sc.with_conversation_start_date(current_date)
+    if knowledge_cutoff is not None:
+        sc = sc.with_knowledge_cutoff(knowledge_cutoff)
+    if system_identity is not None:
+        sc = sc.with_model_identity(system_identity)
+    for bt in builtin_tools:
+        if bt == "browser":
+            sc = sc.with_browser_tool()
+        elif bt == "python":
+            sc = sc.with_python_tool()
+    return sc
+
+
+def _build_developer_messages(
+    prefix_msgs: List[Dict[str, Any]],
+    tool_descs: List[ToolDescription],
+) -> List[HarmonyMessage]:
+    """One Harmony DEVELOPER block per CC system/developer message.
+
+    Tool schemas attach to the first block (so they share it with the
+    first instruction). If there are no CC prefix messages but tools are
+    present, emit a single tools-only DEVELOPER block.
+    """
+    out: List[HarmonyMessage] = []
+    prefix_with_content = [m for m in prefix_msgs if (m.get("content") or "")]
+
+    if not prefix_with_content:
+        if tool_descs:
+            dc = DeveloperContent.new().with_function_tools(tool_descs)
+            out.append(HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, dc))
+        return out
+
+    for i, msg in enumerate(prefix_with_content):
+        dc = DeveloperContent.new().with_instructions(msg["content"])
+        if i == 0 and tool_descs:
+            dc = dc.with_function_tools(tool_descs)
+        out.append(HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, dc))
+    return out
+
+
+def _build_tool_descriptions(
+    tools: Sequence[CCToolDict],
+) -> List[ToolDescription]:
+    """Turn CC-format tool dicts into Harmony ToolDescription objects.
+
+    Tolerates both canonical (`{"type": "function", "function": {...}}`)
+    and flat (`{"name", "description", "parameters"}`) shapes.
+    """
+    out: List[ToolDescription] = []
+    for entry in tools:
+        fn = entry.get("function", entry)
+        name = fn.get("name")
+        if not name:
+            raise ValueError("tool entry missing `name`")
+        out.append(
+            ToolDescription.new(
+                name,
+                fn.get("description", ""),
+                parameters=fn.get("parameters"),
+            )
+        )
+    return out
+
+
+# ---- CC → Harmony conversion (user / assistant / tool only) -------------
 
 
 def _build_tool_name_lookup(conversation: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -149,13 +358,6 @@ def _cc_to_harmony(
     tool_name_by_id: Dict[str, str],
 ) -> List[HarmonyMessage]:
     role = msg["role"]
-
-    if role in ("system", "developer"):
-        return [
-            HarmonyMessage.from_role_and_content(
-                HarmonyRole.DEVELOPER, msg.get("content") or ""
-            )
-        ]
 
     if role == "user":
         return [

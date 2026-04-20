@@ -4,7 +4,8 @@ Mirrors `test_tokenization_qwen3.py`:
   - byte parity against openai-harmony's canonical renderer, one fixture
     per conversation shape (user-only, sys+user+asst, analysis/commentary/
     final channels, tool responses, full multi-channel turn);
-  - role-ID content checks (each Chat Completions role lands on the right
+  - role-ID content checks (Harmony system block → Role.OTHER; CC
+    system/developer → Role.SYSTEM; each CC role lands on the right
     Role enum int; Harmony template bytes are Role.OTHER).
 
 Requires the openai-harmony package (already a repo-level dependency).
@@ -12,14 +13,16 @@ Requires the openai-harmony package (already a repo-level dependency).
 
 from __future__ import annotations
 
-import json
-
 from openai_harmony import (
     Author,
     Conversation,
+    DeveloperContent,
     HarmonyEncodingName,
     Message as HarmonyMessage,
+    ReasoningEffort,
     Role as HarmonyRole,
+    SystemContent,
+    ToolDescription,
     load_harmony_encoding,
 )
 
@@ -38,6 +41,30 @@ from torchllms.messages.tokenization_harmony import (
 
 
 # ---------------------------------------------------------------------------
+# Default SystemContent (matches the implementation defaults).
+# ---------------------------------------------------------------------------
+
+
+def _default_system_content() -> SystemContent:
+    return (
+        SystemContent.new()
+        .with_reasoning_effort(ReasoningEffort.LOW)
+        .with_required_channels(["analysis", "commentary", "final"])
+    )
+
+
+def _system_msg() -> HarmonyMessage:
+    return HarmonyMessage.from_role_and_content(HarmonyRole.SYSTEM, _default_system_content())
+
+
+def _developer_msg(instructions: str) -> HarmonyMessage:
+    return HarmonyMessage.from_role_and_content(
+        HarmonyRole.DEVELOPER,
+        DeveloperContent.new().with_instructions(instructions),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Fixtures: each returns (cc_messages, harmony_messages) so we can compare
 # our tokenize_harmony_conversation output against the canonical rendering
 # of a hand-built Harmony conversation.
@@ -46,7 +73,10 @@ from torchllms.messages.tokenization_harmony import (
 
 def _fx_user_only():
     cc = [{"role": "user", "content": "Hi"}]
-    hm = [HarmonyMessage.from_role_and_content(HarmonyRole.USER, "Hi")]
+    hm = [
+        _system_msg(),
+        HarmonyMessage.from_role_and_content(HarmonyRole.USER, "Hi"),
+    ]
     return cc, hm
 
 
@@ -56,7 +86,8 @@ def _fx_system_user():
         {"role": "user", "content": "Hi"},
     ]
     hm = [
-        HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, "Be helpful."),
+        _system_msg(),
+        _developer_msg("Be helpful."),
         HarmonyMessage.from_role_and_content(HarmonyRole.USER, "Hi"),
     ]
     return cc, hm
@@ -68,7 +99,8 @@ def _fx_developer_user():
         {"role": "user", "content": "Hi"},
     ]
     hm = [
-        HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, "Be helpful."),
+        _system_msg(),
+        _developer_msg("Be helpful."),
         HarmonyMessage.from_role_and_content(HarmonyRole.USER, "Hi"),
     ]
     return cc, hm
@@ -81,7 +113,8 @@ def _fx_sys_user_asst_final():
         {"role": "assistant", "content": "Hello!"},
     ]
     hm = [
-        HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, "Be helpful."),
+        _system_msg(),
+        _developer_msg("Be helpful."),
         HarmonyMessage.from_role_and_content(HarmonyRole.USER, "Hi"),
         HarmonyMessage.from_role_and_content(HarmonyRole.ASSISTANT, "Hello!")
             .with_channel("final"),
@@ -99,6 +132,7 @@ def _fx_asst_reasoning_then_final():
         },
     ]
     hm = [
+        _system_msg(),
         HarmonyMessage.from_role_and_content(HarmonyRole.USER, "What is 2+2?"),
         HarmonyMessage.from_role_and_content(HarmonyRole.ASSISTANT, "basic arithmetic.")
             .with_channel("analysis"),
@@ -130,6 +164,7 @@ def _fx_tool_call_and_result():
     ]
     author_tool = Author.new(HarmonyRole.TOOL, "bash")
     hm = [
+        _system_msg(),
         HarmonyMessage.from_role_and_content(HarmonyRole.USER, "List /tmp"),
         HarmonyMessage.from_role_and_content(HarmonyRole.ASSISTANT, "Use bash")
             .with_channel("analysis"),
@@ -158,9 +193,27 @@ def _fx_asst_reasoning_only_last_turn():
         {"role": "assistant", "reasoning_content": "REASONING", "content": ""},
     ]
     hm = [
+        _system_msg(),
         HarmonyMessage.from_role_and_content(HarmonyRole.USER, "Q"),
         HarmonyMessage.from_role_and_content(HarmonyRole.ASSISTANT, "REASONING")
             .with_channel("analysis"),
+    ]
+    return cc, hm
+
+
+def _fx_system_and_developer_separate():
+    """CC `system` and CC `developer` stay as two distinct Harmony DEVELOPER
+    blocks rather than being concatenated into one."""
+    cc = [
+        {"role": "system", "content": "S-text"},
+        {"role": "developer", "content": "D-text"},
+        {"role": "user", "content": "U"},
+    ]
+    hm = [
+        _system_msg(),
+        _developer_msg("S-text"),
+        _developer_msg("D-text"),
+        HarmonyMessage.from_role_and_content(HarmonyRole.USER, "U"),
     ]
     return cc, hm
 
@@ -173,7 +226,8 @@ def _fx_multi_turn():
         {"role": "user", "content": "How are you?"},
     ]
     hm = [
-        HarmonyMessage.from_role_and_content(HarmonyRole.DEVELOPER, "Be concise."),
+        _system_msg(),
+        _developer_msg("Be concise."),
         HarmonyMessage.from_role_and_content(HarmonyRole.USER, "Hi"),
         HarmonyMessage.from_role_and_content(HarmonyRole.ASSISTANT, "Hello")
             .with_channel("final"),
@@ -190,6 +244,7 @@ FIXTURES = {
     "asst_reasoning_then_final": _fx_asst_reasoning_then_final,
     "asst_reasoning_only_last_turn": _fx_asst_reasoning_only_last_turn,
     "tool_call_and_result": _fx_tool_call_and_result,
+    "system_and_developer_separate": _fx_system_and_developer_separate,
     "multi_turn": _fx_multi_turn,
 }
 
@@ -229,6 +284,12 @@ def _assert_parity(enc, cc_msgs, harmony_msgs, add_generation_prompt):
     )
 
 
+def _decode_role(enc, ids, roles, target_role: Role) -> str:
+    target = int(target_role)
+    toks = [t for t, r in zip(ids, roles) if r == target]
+    return enc.decode(toks)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -245,9 +306,28 @@ def test_harmony_byte_parity():
                 raise AssertionError(f"fixture={name} add_gp={add_gp}: {e}") from e
 
 
+def test_role_ids_system_block_is_other():
+    """Harmony system block content tokens are Role.OTHER; CC
+    system/developer content (rendered into DEVELOPER block) is Role.SYSTEM."""
+    enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    cc = [
+        {"role": "system", "content": "Be nice."},
+        {"role": "user", "content": "U"},
+    ]
+    ids, roles = tokenize_harmony_conversation(cc, add_generation_prompt=False)
+    # SYSTEM-block metadata ("Reasoning: low", "# Valid channels...") must
+    # NOT show up in the SYSTEM-tagged slice.
+    system_slice = _decode_role(enc, ids, roles, Role.SYSTEM)
+    assert "Reasoning" not in system_slice, system_slice
+    assert "Valid channels" not in system_slice, system_slice
+    # CC system content lands inside the DEVELOPER block under `# Instructions`.
+    assert "# Instructions" in system_slice, system_slice
+    assert "Be nice." in system_slice, system_slice
+
+
 def test_role_ids_basic():
-    """SYSTEM / USER / ASSISTANT content carry their respective role ints;
-    every Harmony special token gets Role.OTHER."""
+    """CC system → Role.SYSTEM, user → Role.USER, assistant → Role.ASSISTANT.
+    Every Harmony special token is Role.OTHER."""
     cc = [
         {"role": "system", "content": "S"},
         {"role": "user", "content": "U"},
@@ -363,10 +443,136 @@ def test_tool_without_name_raises():
     raise AssertionError("expected ValueError for nameless tool message")
 
 
-def _decode_role(enc, ids, roles, target_role: Role) -> str:
-    target = int(target_role)
-    toks = [t for t, r in zip(ids, roles) if r == target]
-    return enc.decode(toks)
+def test_mid_conversation_system_raises():
+    cc = [
+        {"role": "user", "content": "Hi"},
+        {"role": "system", "content": "late system"},
+    ]
+    try:
+        tokenize_harmony_conversation(cc)
+    except ValueError as e:
+        assert "start" in str(e)
+        return
+    raise AssertionError("expected ValueError for mid-conversation system")
+
+
+def test_reasoning_effort_appears_in_system_block():
+    enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    cc = [{"role": "user", "content": "Hi"}]
+    for effort in ("low", "medium", "high"):
+        ids, _ = tokenize_harmony_conversation(cc, reasoning_effort=effort)
+        text = enc.decode(ids)
+        assert f"Reasoning: {effort}" in text, (effort, text[:200])
+
+
+def test_reasoning_effort_invalid_raises():
+    try:
+        tokenize_harmony_conversation([{"role": "user", "content": "x"}], reasoning_effort="ultra")
+    except ValueError as e:
+        assert "reasoning_effort" in str(e)
+        return
+    raise AssertionError("expected ValueError for invalid reasoning_effort")
+
+
+def test_valid_channels_invalid_raises():
+    try:
+        tokenize_harmony_conversation(
+            [{"role": "user", "content": "x"}],
+            valid_channels=("analysis", "whoops"),
+        )
+    except ValueError as e:
+        assert "valid_channels" in str(e)
+        return
+    raise AssertionError("expected ValueError for invalid channel name")
+
+
+def test_builtin_tools_invalid_raises():
+    try:
+        tokenize_harmony_conversation(
+            [{"role": "user", "content": "x"}],
+            builtin_tools=("browser", "shell"),
+        )
+    except ValueError as e:
+        assert "builtin_tools" in str(e)
+        return
+    raise AssertionError("expected ValueError for invalid builtin tool")
+
+
+def test_valid_channels_empty_suppresses_declaration():
+    enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    cc = [{"role": "user", "content": "Hi"}]
+    ids, _ = tokenize_harmony_conversation(cc, valid_channels=())
+    assert "Valid channels" not in enc.decode(ids)
+
+
+def test_current_date_and_knowledge_cutoff_appear():
+    enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    cc = [{"role": "user", "content": "Hi"}]
+    ids, _ = tokenize_harmony_conversation(
+        cc, current_date="2026-04-20", knowledge_cutoff="2025-12"
+    )
+    text = enc.decode(ids)
+    assert "2026-04-20" in text
+    assert "Knowledge cutoff: 2025-12" in text
+
+
+def test_tools_kwarg_renders_function_namespace():
+    """`tools=[CC dict]` → DEVELOPER block carries `# Tools` + namespace."""
+    enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    cc = [{"role": "user", "content": "Hi"}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a shell command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+    ids, roles = tokenize_harmony_conversation(cc, tools=tools)
+    text = enc.decode(ids)
+    assert "# Tools" in text
+    assert "namespace functions" in text
+    assert "type bash" in text
+
+    # Tool schema lives inside the DEVELOPER block → Role.SYSTEM.
+    system_slice = _decode_role(enc, ids, roles, Role.SYSTEM)
+    assert "type bash" in system_slice, system_slice
+
+
+def test_tools_flat_shape_supported():
+    """Flat tool dict (no outer 'function') also works."""
+    enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    cc = [{"role": "user", "content": "Hi"}]
+    tools = [{"name": "bash", "description": "D", "parameters": {"type": "object"}}]
+    ids, _ = tokenize_harmony_conversation(cc, tools=tools)
+    assert "type bash" in enc.decode(ids)
+
+
+def test_tools_missing_name_raises():
+    cc = [{"role": "user", "content": "x"}]
+    try:
+        tokenize_harmony_conversation(cc, tools=[{"description": "no name"}])
+    except ValueError as e:
+        assert "name" in str(e)
+        return
+    raise AssertionError("expected ValueError for nameless tool")
+
+
+def test_builtin_browser_tool():
+    enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    cc = [{"role": "user", "content": "Hi"}]
+    ids, roles = tokenize_harmony_conversation(cc, builtin_tools=("browser",))
+    text = enc.decode(ids)
+    assert "browser" in text.lower()
+    # The browser tool namespace is emitted inside the SYSTEM block → Role.OTHER.
+    system_slice = _decode_role(enc, ids, roles, Role.SYSTEM)
+    assert "browser" not in system_slice.lower(), system_slice
 
 
 # ---------------------------------------------------------------------------
