@@ -11,7 +11,7 @@ Modeling and training code are mostly contained within single files: [torchllms/
 This library uses FSDP 2.0 for single-GPU or multi-GPU training on a single node.
 We support Llama 3, Qwen 2.5, and OLMo 2 models, which means many other models may also be incidentally supported.
 
-We also implement basic inference code, using KV caching and batched decoding, for use with custom architectures/inference strategies (e.g. instructional segment embeddings and classifier-free guidance). If you are just fine-tuning a standard model, you should convert the resulting weights back to the standard HuggingFace format with `torchllms/models/checkpoint_converter.py` and use vLLM for inference.
+We also implement basic inference code, using KV caching and batched decoding, for use with custom architectures/inference strategies (e.g. instructional segment embeddings). If you are just fine-tuning a standard model, you should convert the resulting weights back to the standard HuggingFace format with `torchllms/models/checkpoint_converter.py` and use vLLM for inference.
 
 This repo uses a custom format for model weights than the standard HuggingFace format, based on the [original Llama implementation](https://github.com/meta-llama/llama/blob/main/llama/model.py). You can convert between the two formats with [torchllms/models/checkpoint_converter.py](torchllms/models/checkpoint_converter.py).
 
@@ -132,3 +132,7 @@ You can also chat with models in HF format:
 ```bash
 python -m torchllms.inference.chat_huggingface --model_path outputs/lowercase
 ```
+
+## Deprecations
+
+Classifier-free guidance (CFG) and contrastive decoding (CD) were removed 2026-04-20. Last commit with full support: [`9a85f94`](../../commit/9a85f94).

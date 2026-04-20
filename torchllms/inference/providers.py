@@ -2,7 +2,7 @@ import concurrent
 import os
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from typing import List, Tuple, Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from rich.progress import track
@@ -157,40 +157,16 @@ class torchllms(BaseProvider):
         template_config=None,
         model_kwargs=None,
         batched=False,
-        lp_kwargs=None,
     ):
         from torchllms import inference
-        from torchllms.inference import logit_processors
 
-        if lp_kwargs is not None:
-            lp_type = lp_kwargs.pop("type")
-            self.logit_processor = logit_processors.PROCESSORS[lp_type](**lp_kwargs)
-            self.model = inference.ContrastiveLLM(
-                ckpt_paths=[model_path],
-                max_len=max_model_len,
-                template_config=template_config,
-                model_kwargs=model_kwargs,
-                batched=batched,
-            )
-        else:
-            self.logit_processor = None
-            self.model = inference.LLM(
-                ckpt_paths=[model_path],
-                max_len=max_model_len,
-                template_config=template_config,
-                model_kwargs=model_kwargs,
-                batched=batched,
-            )
-
-    @staticmethod
-    def _no_system_builder(
-        conversations: List[List[dict[str, str]]],
-    ) -> Tuple[List[List[dict[str, str]]], List[List[dict[str, str]]]]:
-        negative_conversations = [
-            deepcopy(conv[1:]) for conv in conversations if conv[0]["role"] == "system"
-        ]
-        assert len(negative_conversations) == len(conversations)
-        return conversations, negative_conversations
+        self.model = inference.LLM(
+            ckpt_paths=[model_path],
+            max_len=max_model_len,
+            template_config=template_config,
+            model_kwargs=model_kwargs,
+            batched=batched,
+        )
 
     def generate(
         self,
@@ -204,17 +180,8 @@ class torchllms(BaseProvider):
         assert conversations is None or prompts is None
 
         if conversations is not None:
-            if self.logit_processor:
-                conversations, negative_conversations = torchllms._no_system_builder(
-                    conversations
-                )
-            else:
-                negative_conversations = None
-
             responses = self.model.generate(
                 conversations=conversations,
-                negative_conversations=negative_conversations,
-                logit_processor=self.logit_processor,
                 **kwargs,
             )
 
