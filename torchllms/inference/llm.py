@@ -4,11 +4,10 @@ But if you want to test out custom architectures or inference strategies, it's a
 
 `LLM._generate_single()` is a simple decoding loop for a single sequence.
 `LLM._generate_multiple()` uses batching which is faster but more complicated.
-
-If you're interested in classifier-free guidance/contrastive decoding, please see `llm_cfg.py`.
 """
 
 import gc
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -25,6 +24,23 @@ def get_batches(iterable, n=1):
     total = len(iterable)
     for ndx in range(0, total, n):
         yield iterable[ndx : min(ndx + n, total)]
+
+
+@dataclass
+class GenerationResult:
+    """Output of a single-sequence generation call.
+
+    token_ids includes the stop token when generation stopped on a stop ID.
+    text is decoded with skip_special_tokens=True so stop tokens are absent
+    from it — use stop_reason to distinguish which stop fired (required for
+    e.g. gpt-oss <|call|> vs <|return|> disambiguation).
+    stop_reason is the triggering token ID, or None if generation hit
+    max_new_tokens / max_len without matching any stop ID.
+    """
+
+    text: str
+    token_ids: List[int]
+    stop_reason: Optional[int]
 
 
 class LLM:
@@ -85,7 +101,12 @@ class LLM:
             eos_ids = [self.tokenizer.eos_token_id]
             print("[warning] using default eos_token_id as eot_ids")
 
-        self.eos_ids = eos_ids
+        # stop_token_ids is "any-of" semantics: generation halts the moment
+        # any of these token IDs is emitted. Store as both list (for ordered
+        # display / downstream consumers that expect a sequence) and set
+        # (for O(1) membership checks in the decode loop).
+        self.eos_ids = list(eos_ids)
+        self.eos_set = set(self.eos_ids)
 
     def tokenize_conversation(self, conversation: List[Dict[str, str]]) -> torch.Tensor:
         inputs = {}
@@ -114,8 +135,14 @@ class LLM:
         role_ids: Optional[torch.Tensor] = None,
         temperature: float = 0.0,
         max_new_tokens: Optional[int] = None,
-        return_token_ids: bool = False,
-    ):
+    ) -> GenerationResult:
+        """Greedy/temperature decode one sequence and return a GenerationResult.
+
+        Stops as soon as a sampled token is in `self.eos_set` (any-of
+        semantics) or when max_new_tokens / max_len is exhausted. The
+        triggering stop token is reported via `stop_reason`; `None` means
+        budget-exhausted.
+        """
         input_ids = input_ids.view(1, -1)
         prompt_len = input_ids.shape[1]
 
@@ -124,7 +151,7 @@ class LLM:
             max_new_tokens_ = min(max_new_tokens_, max_new_tokens)
 
         if max_new_tokens_ < 1:
-            return ""
+            return GenerationResult(text="", token_ids=[], stop_reason=None)
 
         if role_ids is not None:
             role_ids = role_ids.view(1, -1)
@@ -170,55 +197,44 @@ class LLM:
         )
         cur_token, _ = inference.utils.sample(logits, temperature=temperature)
 
-        new_tokens = torch.full(
-            (max_new_tokens_,),
-            fill_value=-1,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        new_tokens[0] = cur_token.squeeze()
+        cur = int(cur_token.squeeze().item())
+        generated_token_ids: List[int] = [cur]
+        stop_reason: Optional[int] = cur if cur in self.eos_set else None
 
-        generated_token_ids: List[int] = [int(cur_token.squeeze().item())]
-
-        if generated_token_ids == self.eos_ids:
-            response = ""
-            self._insert_prefix_cache(cache, prompt_tokens + generated_token_ids)
-            return response
-
-        i = 0
-        for i in range(1, max_new_tokens_):
-            logits, cache = self.model(
-                input_ids=cur_token.view(1, -1),
-                role_ids=asst_role,
-                cache=cache,
-                logits_to_keep=1,
-            )
-            cur_token, _ = inference.utils.sample(logits, temperature=temperature)
-
-            new_tokens[i] = cur_token.squeeze()
-            generated_token_ids.append(int(cur_token.squeeze().item()))
-
-            last_tokens = new_tokens[i + 1 - len(self.eos_ids) : i + 1].tolist()
-            if last_tokens == self.eos_ids:
-                break
-
-        new_tokens_list = new_tokens[: i + 1].tolist()
-
-        if i == max_new_tokens_ - 1:
-            if max_new_tokens_ == max_new_tokens:
-                print("[warning] max_new_tokens reached")
+        if stop_reason is None:
+            for i in range(1, max_new_tokens_):
+                logits, cache = self.model(
+                    input_ids=cur_token.view(1, -1),
+                    role_ids=asst_role,
+                    cache=cache,
+                    logits_to_keep=1,
+                )
+                cur_token, _ = inference.utils.sample(logits, temperature=temperature)
+                cur = int(cur_token.squeeze().item())
+                generated_token_ids.append(cur)
+                if cur in self.eos_set:
+                    stop_reason = cur
+                    break
             else:
-                print("[warning] max_len reached")
+                # Loop completed without `break`: budget exhausted. Keep the
+                # warnings for humans tailing logs; callers that prefer a
+                # programmatic signal read `stop_reason is None`.
+                if max_new_tokens_ == max_new_tokens:
+                    print("[warning] max_new_tokens reached")
+                else:
+                    print("[warning] max_len reached")
 
         # --- Prefix cache insert -------------------------------------------
         # Stash the full (prompt + generated) KV so the next turn can reuse
         # this prefix.
         self._insert_prefix_cache(cache, prompt_tokens + generated_token_ids)
 
-        response = self.tokenizer.decode(new_tokens_list, skip_special_tokens=True)
-        if return_token_ids:
-            return response, new_tokens_list
-        return response
+        text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        return GenerationResult(
+            text=text,
+            token_ids=generated_token_ids,
+            stop_reason=stop_reason,
+        )
 
     def _insert_prefix_cache(self, cache, full_tokens: List[int]) -> None:
         if self.prefix_cache is None:
@@ -284,12 +300,12 @@ class LLM:
             encoding = {
                 k: torch.tensor(v, device=self.device) for k, v in encoding.items()
             }
-            response = self._generate_single(
+            result = self._generate_single(
                 **encoding,
                 temperature=temperature,
                 max_new_tokens=max_new_tokens,
             )
-            responses.append(response)
+            responses.append(result.text)
 
             del encoding
             torch.cuda.empty_cache()

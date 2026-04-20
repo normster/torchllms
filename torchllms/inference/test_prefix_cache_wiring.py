@@ -123,7 +123,10 @@ def _build_llm(model, prefix_cache=None, max_len=256, eos_ids=None) -> LLM:
     llm.max_len = max_len
     llm.device = "cpu"
     llm.batched = False
-    llm.eos_ids = eos_ids or [0]  # 0 is never produced by our fake (argmax=(p+1)%V, p≥0)
+    # 0 is never produced by our fake (argmax=(p+1)%V, p≥0) so the default
+    # exercises the max_new_tokens exit path.
+    llm.eos_ids = list(eos_ids) if eos_ids is not None else [0]
+    llm.eos_set = set(llm.eos_ids)
     llm.prefix_cache = prefix_cache
     return llm
 
@@ -142,7 +145,8 @@ def test_no_prefix_cache_matches_baseline():
     # Greedy logits at query pos p produce token (p+1) % VOCAB. Prompt of
     # length 5 occupies positions 0..4; first sample (pos 4) = 5, then
     # 6, 7, 8, 9, 10 from positions 5..9.
-    assert out == "5 6 7 8 9 10", f"got {out!r}"
+    assert out.text == "5 6 7 8 9 10", f"got {out.text!r}"
+    assert out.stop_reason is None  # budget exhausted, no eos match
     # One prefill call (5 tokens) + 5 decode calls = 6 total.
     assert len(model.forward_calls) == 6
     assert model.forward_calls[0]["seqlen"] == 5
@@ -162,7 +166,7 @@ def test_prefix_cache_populated_after_call():
     llm = _build_llm(model, prefix_cache=cache)
     prompt = torch.tensor([[5, 6, 7, 8, 9]], dtype=torch.long)
     out = llm._generate_single(prompt, max_new_tokens=3)
-    assert out == "5 6 7", f"got {out!r}"
+    assert out.text == "5 6 7", f"got {out.text!r}"
     # Cached: prompt (5) + generated (3) - 1 = 7 tokens.
     match = cache.lookup([5, 6, 7, 8, 9, 5, 6])
     assert match.hit and match.length == 7
@@ -188,7 +192,7 @@ def test_second_call_reuses_prefix():
     assert model.forward_calls[0]["seqlen"] == 2
     # Query token count = 7, abs positions 0..6. First sample from pos 6 → 7.
     # Then 8, 9.
-    assert out_b == "7 8 9", f"got {out_b!r}"
+    assert out_b.text == "7 8 9", f"got {out_b.text!r}"
 
 
 def test_cached_and_uncached_produce_identical_output():
@@ -209,7 +213,10 @@ def test_cached_and_uncached_produce_identical_output():
     # Now generate from the full 7-token prompt.
     model_b.forward_calls.clear()
     out_b = llm_b._generate_single(prompt, max_new_tokens=4)
-    assert out_a == out_b, f"output differs: {out_a!r} vs {out_b!r}"
+    assert out_a.text == out_b.text, f"text differs: {out_a.text!r} vs {out_b.text!r}"
+    assert out_a.token_ids == out_b.token_ids, (
+        f"token_ids differ: {out_a.token_ids!r} vs {out_b.token_ids!r}"
+    )
 
 
 def test_full_prefix_match_leaves_one_token_to_prefill():
@@ -228,7 +235,70 @@ def test_full_prefix_match_leaves_one_token_to_prefill():
     # Prefill must be at least 1 token even though all 5 matched in the cache.
     assert model.forward_calls[0]["seqlen"] == 1
     # Output must match the first call's.
-    assert out == "5 6 7", f"got {out!r}"
+    assert out.text == "5 6 7", f"got {out.text!r}"
+
+
+# ------------------------------------------------------------------
+# Stop-token semantics
+# ------------------------------------------------------------------
+
+
+def test_stop_token_any_of_fires_on_first_match():
+    """eos_set is any-of: the loop must stop on the first sampled stop ID.
+
+    FakeTransformer produces tokens 5, 6, 7, ... after a 5-token prompt. With
+    eos_ids=[7, 6], the *first* stop to fire is 6 (at step 2). 7 never gets
+    sampled, so a multi-token-suffix interpretation would run to budget; the
+    set-membership interpretation stops here.
+    """
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None, eos_ids=[7, 6])
+    prompt = torch.tensor([[5, 6, 7, 8, 9]], dtype=torch.long)
+    out = llm._generate_single(prompt, max_new_tokens=10)
+    assert out.stop_reason == 6, f"got {out.stop_reason!r}"
+    assert out.token_ids == [5, 6], f"got {out.token_ids!r}"
+    assert out.text == "5 6", f"got {out.text!r}"
+
+
+def test_stop_token_on_first_sample():
+    """First sampled token equal to a stop ID must return immediately with
+    stop_reason set and the stop token present in token_ids."""
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None, eos_ids=[5])
+    prompt = torch.tensor([[5, 6, 7, 8, 9]], dtype=torch.long)
+    out = llm._generate_single(prompt, max_new_tokens=10)
+    assert out.stop_reason == 5, f"got {out.stop_reason!r}"
+    assert out.token_ids == [5], f"got {out.token_ids!r}"
+    # Only the prefill forward should have happened; no decode steps.
+    assert len(model.forward_calls) == 1
+
+
+def test_no_stop_match_reports_stop_reason_none():
+    """Budget exhaustion (no stop ID ever sampled) must set stop_reason=None."""
+    model = FakeTransformer()
+    # 99 is never produced by FakeTransformer (argmax=(p+1)%32 over small p).
+    llm = _build_llm(model, prefix_cache=None, eos_ids=[99])
+    prompt = torch.tensor([[5, 6, 7, 8, 9]], dtype=torch.long)
+    out = llm._generate_single(prompt, max_new_tokens=4)
+    assert out.stop_reason is None
+    assert len(out.token_ids) == 4
+
+
+def test_multiple_alternatives_semantics():
+    """Alternatives, not a sequence: eos_ids=[A, B] stops on A or B
+    independently. The original bug treated [A, B] as the ordered pair — the
+    loop would only break if positions i-1, i were exactly [A, B]. Here the
+    generated stream is 5, 6, 7, 8, ... so positions 1-2 are [6, 7]: under
+    the buggy semantics with eos_ids=[6, 7] the break IS accidentally
+    triggered. With eos_ids=[8, 6] (no subsequence match) the buggy code
+    would run to budget; the fixed code stops on 6 at step 2.
+    """
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None, eos_ids=[8, 6])
+    prompt = torch.tensor([[5, 6, 7, 8, 9]], dtype=torch.long)
+    out = llm._generate_single(prompt, max_new_tokens=10)
+    assert out.stop_reason == 6, f"got {out.stop_reason!r}"
+    assert out.token_ids == [5, 6], f"got {out.token_ids!r}"
 
 
 if __name__ == "__main__":
