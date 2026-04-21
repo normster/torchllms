@@ -22,8 +22,9 @@
 # limitations under the License.
 
 import math
+from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Callable, List, Literal, Optional
 
 try:
     from flash_attn import flash_attn_func, flash_attn_with_kvcache
@@ -40,6 +41,26 @@ from pydantic import BaseModel
 from torchllms.messages import Role
 from torchllms.models import utils
 from torchllms.models.cache import KVArena
+
+
+@dataclass(frozen=True)
+class HookContext:
+    """Metadata passed to activation-intervention hooks.
+
+    All tensor fields describe only the active tokens in the current forward
+    call. Cached-prefix positions are intentionally not exposed here.
+    """
+
+    layer_id: int
+    site: Literal["post_block"]
+    step_type: Literal["prefill", "decode"]
+    input_ids: torch.Tensor
+    role_ids: Optional[torch.Tensor]
+    input_pos: Optional[torch.Tensor]
+    alpha: Optional[float] = None
+
+
+ActivationHook = Callable[[torch.Tensor, HookContext], torch.Tensor]
 
 
 class AttentionImpl(Enum):
@@ -394,8 +415,24 @@ def _sdpa_attention(
         attn_mask = utils.to_4d_and_causal(attn_mask, qlen, xq.dtype, seqlen)
         is_causal = False
     else:
-        # don't need causal masking for decoding
-        is_causal = seqlen == qlen
+        if seqlen == qlen:
+            is_causal = True
+        elif qlen == 1:
+            # Decode step: the single query is the newest token and may
+            # attend to every cached key/value position.
+            is_causal = False
+        else:
+            # Partial-cache prefill: qlen is the uncached suffix length while
+            # seqlen includes the loaded prefix. SDPA's is_causal=True assumes
+            # q and k have equal lengths, so build the shifted causal mask
+            # explicitly.
+            attn_mask = utils._make_causal_mask(
+                (bsz, qlen),
+                xq.dtype,
+                device=xq.device,
+                past_key_values_length=seqlen - qlen,
+            )
+            is_causal = False
 
     output = torch.nn.functional.scaled_dot_product_attention(
         xq,
@@ -461,6 +498,7 @@ class Attention(nn.Module):
         cache: Optional[KVArena] = None,
         attn_mask: Optional[torch.Tensor] = None,
         use_kvcache_attn: bool = False,
+        static_kvcache_attn: bool = False,
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -476,10 +514,23 @@ class Attention(nn.Module):
         xq = self.rope(xq, input_pos=input_pos)
         xk = self.rope(xk, input_pos=input_pos)
 
-        if cache is not None:
+        cache_seqlens = None
+        if cache is not None and static_kvcache_attn:
+            assert flash_attn_with_kvcache is not None, (
+                "static_kvcache_attn requires flash_attn installed"
+            )
+            xk, xv, cache_seqlens = cache.update_kv_decode_static(
+                self.layer_id, xk, xv,
+            )
+        elif cache is not None:
             xk, xv = cache.update_kv(self.layer_id, xk, xv)
 
-        if use_kvcache_attn:
+        if static_kvcache_attn:
+            assert cache_seqlens is not None
+            output = _flash_attention_with_kvcache(
+                xq, xk, xv, cache_seqlens.to(torch.int32),
+            )
+        elif use_kvcache_attn:
             # Per-row diverging cache lengths: route to flash_attn_with_kvcache.
             # Requires flash_attn and a cache to read seen_tokens from.
             assert cache is not None and flash_attn_with_kvcache is not None, (
@@ -573,6 +624,7 @@ class TransformerBlock(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[KVArena] = None,
         use_kvcache_attn: bool = False,
+        static_kvcache_attn: bool = False,
     ):
         h = x + self.attention(
             x=self.attention_norm(x),
@@ -581,6 +633,7 @@ class TransformerBlock(nn.Module):
             input_pos=input_pos,
             cache=cache,
             use_kvcache_attn=use_kvcache_attn,
+            static_kvcache_attn=static_kvcache_attn,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -635,6 +688,60 @@ class Transformer(nn.Module):
             self.output = lambda x: nn.functional.linear(x, self.tok_embeddings.weight)
         else:
             self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.activation_hooks: List[ActivationHook] = []
+        self.activation_hook_modules = nn.ModuleList()
+        self.activation_hook_alpha: Optional[float] = None
+
+    def set_activation_hooks(
+        self,
+        hooks: ActivationHook | List[ActivationHook],
+        *,
+        alpha: Optional[float] = None,
+    ) -> None:
+        if callable(hooks):
+            hooks = [hooks]
+        self.activation_hooks = list(hooks)
+        self.activation_hook_modules = nn.ModuleList(
+            hook for hook in self.activation_hooks if isinstance(hook, nn.Module)
+        )
+        self.activation_hook_alpha = None if alpha is None else float(alpha)
+
+    def clear_activation_hooks(self) -> None:
+        self.activation_hooks = []
+        self.activation_hook_modules = nn.ModuleList()
+        self.activation_hook_alpha = None
+
+    def _apply_activation_hooks(
+        self,
+        hidden: torch.Tensor,
+        *,
+        layer_id: int,
+        step_type: Literal["prefill", "decode"],
+        input_ids: torch.Tensor,
+        role_ids: Optional[torch.Tensor],
+        input_pos: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if not self.activation_hooks:
+            return hidden
+
+        ctx = HookContext(
+            layer_id=layer_id,
+            site="post_block",
+            step_type=step_type,
+            input_ids=input_ids,
+            role_ids=role_ids,
+            input_pos=input_pos,
+            alpha=self.activation_hook_alpha,
+        )
+        expected_shape = hidden.shape
+        for hook in self.activation_hooks:
+            hidden = hook(hidden, ctx)
+            if hidden.shape != expected_shape:
+                raise ValueError(
+                    "activation hook must preserve hidden shape: "
+                    f"expected {tuple(expected_shape)}, got {tuple(hidden.shape)}"
+                )
+        return hidden
 
     def init_cache(
         self, max_batch_size: int, device: str, max_cache_len: Optional[int] = None
@@ -671,6 +778,10 @@ class Transformer(nn.Module):
         cache: Optional[KVArena] = None,
         logits_to_keep: Optional[int] = None,
         use_kvcache_attn: bool = False,
+        static_kvcache_attn: bool = False,
+        update_cache_metadata: bool = True,
+        check_cache_full: bool = True,
+        step_type: Literal["prefill", "decode"] = "prefill",
     ):
         """
         Apply a single forward pass for training or inference (prefill + decoding).
@@ -704,9 +815,10 @@ class Transformer(nn.Module):
         - Missing `cache` skips reading/writing past key/value vectors and role IDs.
         """
 
-        assert (
-            cache is None or not cache.is_full()
-        ), "Maximum sequence length reached, KV cache is full"
+        if check_cache_full:
+            assert (
+                cache is None or not cache.is_full()
+            ), "Maximum sequence length reached, KV cache is full"
 
         # RoPE assumes [0, 1, 2, ...] input_pos when not provided, offset by
         # each row's current absolute position (derived from seen_tokens).
@@ -714,17 +826,44 @@ class Transformer(nn.Module):
             input_pos = torch.arange(input_ids.shape[1])[None, :]
             input_pos = input_pos.to(input_ids.device) + cache.row_positions[:, None]
 
+        context_input_pos = input_pos
+        if context_input_pos is None:
+            context_input_pos = torch.arange(
+                input_ids.shape[1], device=input_ids.device,
+            )[None, :].expand(input_ids.shape[0], -1)
+        elif context_input_pos.dim() == 1:
+            context_input_pos = context_input_pos[None, :].expand(
+                input_ids.shape[0], -1
+            )
+
         h = self.tok_embeddings(input_ids)
 
         if self.role_embeddings is not None and role_ids is not None:
             h += self.role_embeddings(role_ids)
 
-        if cache is not None:
+        active_role_ids = role_ids
+        if cache is not None and update_cache_metadata:
             role_ids = cache.update_role_ids(role_ids)
             attn_mask = cache.update_attn_mask(attn_mask)
 
         for i, layer in enumerate(self.layers):
-            h = layer(h, role_ids, attn_mask, input_pos, cache, use_kvcache_attn)
+            h = layer(
+                h,
+                role_ids,
+                attn_mask,
+                input_pos,
+                cache,
+                use_kvcache_attn,
+                static_kvcache_attn=static_kvcache_attn,
+            )
+            h = self._apply_activation_hooks(
+                h,
+                layer_id=i,
+                step_type=step_type,
+                input_ids=input_ids,
+                role_ids=active_role_ids,
+                input_pos=context_input_pos,
+            )
 
         if logits_to_keep is not None:
             h = h[:, -logits_to_keep:]

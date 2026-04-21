@@ -14,6 +14,7 @@ import torch
 from torchllms.inference.llm import LLM
 from torchllms.inference.prefix_cache import RadixKVCache
 from torchllms.models.cache import KVArena
+from torchllms.models.networks import _eager_attention, _sdpa_attention
 
 
 VOCAB = 32
@@ -71,11 +72,13 @@ class FakeTransformer(torch.nn.Module):
         attn_mask=None,
         input_pos=None,
         use_kvcache_attn=False,
+        step_type="prefill",
     ):
         # The FakeTransformer doesn't actually do attention; it writes
         # deterministic K/V and produces deterministic logits. The
         # use_kvcache_attn flag is accepted for signature parity.
         del use_kvcache_attn
+        del step_type
         B, S = input_ids.shape
         self.forward_calls.append({"input_ids": input_ids.clone(), "seqlen": S})
 
@@ -147,6 +150,25 @@ def _build_llm(model, prefix_cache=None, max_len=256, eos_ids=None) -> LLM:
 # ------------------------------------------------------------------
 
 
+def test_sdpa_partial_cache_prefill_matches_eager_causal_reference():
+    """Partial-cache prefill has qlen < seqlen and qlen > 1.
+
+    That shape needs a shifted causal mask: suffix token i can attend to the
+    loaded prefix and earlier suffix tokens, but not later suffix tokens.
+    """
+    torch.manual_seed(0)
+    bsz, qlen, past, n_heads, head_dim = 2, 3, 2, 2, 4
+    seqlen = past + qlen
+    xq = torch.randn(bsz, qlen, n_heads, head_dim)
+    xk = torch.randn(bsz, seqlen, n_heads, head_dim)
+    xv = torch.randn(bsz, seqlen, n_heads, head_dim)
+
+    eager = _eager_attention(xq, xk, xv, attn_mask=None)
+    sdpa = _sdpa_attention(xq, xk, xv, attn_mask=None)
+    max_diff = (eager - sdpa).abs().max().item()
+    assert max_diff < 1e-5, f"max_diff={max_diff}"
+
+
 def test_no_prefix_cache_matches_baseline():
     """With prefix_cache=None, behavior should be unchanged."""
     model = FakeTransformer()
@@ -161,6 +183,17 @@ def test_no_prefix_cache_matches_baseline():
     # One prefill call (5 tokens) + 5 decode calls = 6 total.
     assert len(model.forward_calls) == 6
     assert model.forward_calls[0]["seqlen"] == 5
+
+
+def test_single_max_new_tokens_zero_returns_empty():
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None)
+    prompt = torch.tensor([[5, 6, 7]], dtype=torch.long)
+    out = llm._generate_single(prompt, max_new_tokens=0)
+    assert out.token_ids == []
+    assert out.text == ""
+    assert out.stop_reason is None
+    assert model.forward_calls == []
 
 
 def test_prefix_cache_populated_after_call():
@@ -359,6 +392,19 @@ def test_multi_budget_exhausted_yields_stop_reason_none():
     for r in out:
         assert r.stop_reason is None
         assert len(r.token_ids) == 3
+
+
+def test_multi_zero_budget_rows_skip_generation():
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None, max_len=5, eos_ids=[0])
+    # Row 0 has zero budget because prompt_len == max_len. Row 1 still has
+    # two tokens of room. The zero-budget row must not receive the first
+    # sampled token from prefill.
+    out = llm._generate_multiple([[1, 2, 3, 4, 5], [1, 2, 3]], max_new_tokens=None)
+    assert out[0].token_ids == []
+    assert out[0].text == ""
+    assert out[0].stop_reason is None
+    assert out[1].token_ids == [3, 4]
 
 
 def test_multi_preserves_input_order():

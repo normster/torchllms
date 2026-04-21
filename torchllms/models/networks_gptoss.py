@@ -536,10 +536,18 @@ class GptOSSTransformer(nn.Module):
         cache: Optional[KVArena] = None,
         logits_to_keep: Optional[int] = None,
         use_kvcache_attn: bool = False,
+        step_type: str = "prefill",
     ):
+        del step_type
         # use_kvcache_attn is accepted for signature parity with the base
-        # Transformer; GptOSS blocks ignore it (custom triton attention).
-        del use_kvcache_attn
+        # Transformer, but the current gpt-oss attention kernel only accepts
+        # one scalar start_q shared across the batch. Diverging cache lengths
+        # must be implemented explicitly before this path can be used.
+        if use_kvcache_attn:
+            raise NotImplementedError(
+                "gpt-oss batched decode with diverging cache lengths is not "
+                "supported by the current single-start_q attention kernel"
+            )
         assert (
             cache is None or not cache.is_full()
         ), "Maximum sequence length reached, KV cache is full"

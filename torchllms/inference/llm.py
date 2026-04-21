@@ -7,6 +7,7 @@ But if you want to test out custom architectures or inference strategies, it's a
 """
 
 import gc
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -18,7 +19,7 @@ from torchllms.inference.prefix_cache import RadixKVCache
 from torchllms.messages import tokenization
 from torchllms.models import utils
 from torchllms.models.cache import RolloutId
-from torchllms.models.networks import AttentionImpl
+from torchllms.models.networks import AttentionImpl, flash_attn_with_kvcache
 
 
 def get_batches(iterable, n=1):
@@ -70,6 +71,9 @@ class LLM:
         model_kwargs: Optional[Dict[str, Any]] = None,
         batched: bool = False,
         prefix_cache: Optional[RadixKVCache] = None,
+        compile_model: Optional[bool] = None,
+        compile_mode: str = "reduce-overhead",
+        static_decode_kvcache: Optional[bool] = None,
     ):
         model, tokenizer, template_config = utils.setup_model_and_tokenizer(
             ckpt_paths,
@@ -81,6 +85,10 @@ class LLM:
         model.eval()
 
         self.model = model
+        self._compiled_model = None
+        self._compiled_decode_model = None
+        self._decode_compile_static_kvcache = False
+        self._static_decode_kvcache = False
         self.tokenizer = tokenizer
         self.template_config = template_config
         self.max_len = max_len
@@ -108,6 +116,122 @@ class LLM:
         # (for O(1) membership checks in the decode loop).
         self.eos_ids = list(eos_ids)
         self.eos_set = set(self.eos_ids)
+
+        if compile_model is None:
+            compile_model = os.environ.get("TORCHLLMS_COMPILE", "").lower() in {
+                "1", "true", "yes", "on",
+            }
+        if compile_model:
+            self.enable_compile(mode=compile_mode)
+        if static_decode_kvcache is None:
+            env_static_decode = os.environ.get("TORCHLLMS_STATIC_DECODE_KVCACHE")
+            if env_static_decode is None:
+                static_decode_kvcache = self._supports_static_decode_kvcache()
+            else:
+                static_decode_kvcache = env_static_decode.lower() in {
+                    "1", "true", "yes", "on",
+                }
+        if static_decode_kvcache:
+            self.enable_static_decode_kvcache()
+
+    def enable_compile(self, *, mode: str = "reduce-overhead") -> None:
+        """Compile the model forward path for decode-loop experiments.
+
+        Keep ``self.model`` as the original module so custom methods like
+        ``init_cache`` and ``set_activation_hooks`` remain directly available.
+        Generation calls route through ``self._compiled_model`` when present.
+        """
+        self._compiled_model = torch.compile(self.model, mode=mode)
+
+    def disable_compile(self) -> None:
+        self._compiled_model = None
+
+    def enable_decode_compile(
+        self,
+        *,
+        mode: str = "reduce-overhead",
+        static_kvcache_attn: bool = True,
+    ) -> None:
+        """Compile only decode forwards.
+
+        Prefill remains eager to avoid variable prompt shapes. Decode can opt
+        into the static FA2 KV-cache path so the compiled body keeps fixed
+        cache tensor shapes while ``cache_seqlens`` carries the live length.
+        """
+        self._compiled_decode_model = torch.compile(self.model, mode=mode)
+        self._decode_compile_static_kvcache = bool(static_kvcache_attn)
+
+    def disable_decode_compile(self) -> None:
+        self._compiled_decode_model = None
+        self._decode_compile_static_kvcache = False
+
+    def enable_static_decode_kvcache(self) -> None:
+        """Use the fixed-shape FA2 kvcache decode path without compiling."""
+        if not self._supports_static_decode_kvcache():
+            raise NotImplementedError(
+                "static decode kvcache requires the base Transformer with "
+                "AttentionImpl.FLASH and flash_attn_with_kvcache available"
+            )
+        self._static_decode_kvcache = True
+
+    def disable_static_decode_kvcache(self) -> None:
+        self._static_decode_kvcache = False
+
+    def _supports_static_decode_kvcache(self) -> bool:
+        params = getattr(self.model, "params", None)
+        if params is None:
+            return False
+        if getattr(params, "gpt_oss_arch", False) or getattr(params, "olmo2_arch", False):
+            return False
+        if getattr(params, "attention_impl", None) != AttentionImpl.FLASH:
+            return False
+        return flash_attn_with_kvcache is not None
+
+    def _prepare_static_decode_kwargs(self, kwargs):
+        cache = kwargs.get("cache")
+        role_ids = kwargs.get("role_ids")
+        attn_mask = kwargs.get("attn_mask")
+        if cache is not None:
+            if role_ids is not None:
+                cache.update_role_ids(role_ids)
+            if attn_mask is not None:
+                cache.update_attn_mask(attn_mask)
+        kwargs["static_kvcache_attn"] = True
+        kwargs["update_cache_metadata"] = False
+        kwargs["check_cache_full"] = False
+        kwargs["use_kvcache_attn"] = False
+        return kwargs
+
+    def _model_forward(self, **kwargs):
+        if (
+            kwargs.get("step_type") == "decode"
+            and getattr(self, "_compiled_decode_model", None) is not None
+        ):
+            if self._decode_compile_static_kvcache:
+                kwargs = self._prepare_static_decode_kwargs(kwargs)
+            return self._compiled_decode_model(**kwargs)
+
+        if (
+            kwargs.get("step_type") == "decode"
+            and getattr(self, "_static_decode_kvcache", False)
+            and self._supports_static_decode_kvcache()
+        ):
+            kwargs = self._prepare_static_decode_kwargs(kwargs)
+
+        compiled_model = getattr(self, "_compiled_model", None)
+        model = compiled_model if compiled_model is not None else self.model
+        return model(**kwargs)
+
+    def set_activation_hooks(self, hooks, *, alpha: Optional[float] = None) -> None:
+        if not hasattr(self.model, "set_activation_hooks"):
+            raise NotImplementedError(
+                f"{type(self.model).__name__} does not expose activation hooks"
+            )
+        self.model.set_activation_hooks(hooks, alpha=alpha)
+
+    def clear_activation_hooks(self) -> None:
+        if hasattr(self.model, "clear_activation_hooks"):
+            self.model.clear_activation_hooks()
 
     def tokenize_conversation(self, conversation: List[Dict[str, str]]) -> torch.Tensor:
         inputs = {}
@@ -148,7 +272,7 @@ class LLM:
         prompt_len = input_ids.shape[1]
 
         max_new_tokens_ = self.max_len - prompt_len
-        if max_new_tokens:
+        if max_new_tokens is not None:
             max_new_tokens_ = min(max_new_tokens_, max_new_tokens)
 
         if max_new_tokens_ < 1:
@@ -191,11 +315,12 @@ class LLM:
         suffix_roles = (
             role_ids[:, prefill_start:] if role_ids is not None else None
         )
-        logits, cache = self.model(
+        logits, cache = self._model_forward(
             input_ids=suffix_ids,
             role_ids=suffix_roles,
             cache=cache,
             logits_to_keep=1,
+            step_type="prefill",
         )
         cur_token, _ = inference.utils.sample(logits, temperature=temperature)
 
@@ -205,11 +330,12 @@ class LLM:
 
         if stop_reason is None:
             for i in range(1, max_new_tokens_):
-                logits, cache = self.model(
+                logits, cache = self._model_forward(
                     input_ids=cur_token.view(1, -1),
                     role_ids=asst_role,
                     cache=cache,
                     logits_to_keep=1,
+                    step_type="decode",
                 )
                 cur_token, _ = inference.utils.sample(logits, temperature=temperature)
                 cur = int(cur_token.squeeze().item())
@@ -379,9 +505,6 @@ class LLM:
                         f"role_ids[{i}] length {len(r)} != prompt length {prompt_lens[i]}"
                     )
 
-        max_prompt_len = max(prompt_lens)
-        uniform_lens = len(set(prompt_lens)) == 1
-
         # Per-row budget: each row can generate up to its own max_new_tokens
         # (clamped by max_len - prompt_len[i]).
         budgets = []
@@ -390,9 +513,28 @@ class LLM:
             if max_new_tokens is not None:
                 b = min(b, max_new_tokens)
             budgets.append(max(0, b))
+
+        results: List[Optional[GenerationResult]] = [None] * B
+        active_indices = [i for i, budget in enumerate(budgets) if budget > 0]
+        for i, budget in enumerate(budgets):
+            if budget <= 0:
+                results[i] = GenerationResult("", [], None)
+        if not active_indices:
+            return results  # type: ignore[return-value]
+
+        original_indices = active_indices
+        prompt_token_lists = [prompt_token_lists[i] for i in active_indices]
+        role_id_lists = (
+            [role_id_lists[i] for i in active_indices]
+            if role_id_lists is not None else None
+        )
+        prompt_lens = [prompt_lens[i] for i in active_indices]
+        budgets = [budgets[i] for i in active_indices]
+        B = len(prompt_token_lists)
+
+        max_prompt_len = max(prompt_lens)
+        uniform_lens = len(set(prompt_lens)) == 1
         max_budget = max(budgets)
-        if max_budget < 1:
-            return [GenerationResult("", [], None) for _ in range(B)]
 
         # Per-row prefix-cache lookup. Leave ≥1 suffix token per row so the
         # prefill forward produces fresh logits for the first sample.
@@ -479,12 +621,13 @@ class LLM:
                     device=self.device,
                 )
 
-            logits, _ = self.model(
+            logits, _ = self._model_forward(
                 input_ids=next_input,
                 role_ids=next_roles,
                 cache=cache,
                 logits_to_keep=1,
                 use_kvcache_attn=decode_use_kvcache_attn,
+                step_type="decode",
             )
             sampled, _ = inference.utils.sample(logits, temperature=temperature)
             new_tokens = sampled.view(-1).tolist()
@@ -503,12 +646,12 @@ class LLM:
         if cache.b_live > 0:
             _retire_and_insert(list(cache.active_rollouts()))
 
-        results: List[Optional[GenerationResult]] = [None] * B
         for rid in rids:
             i = origin_of[rid]
+            original_i = original_indices[i]
             gen = generated[rid]
             text = self.tokenizer.decode(gen, skip_special_tokens=True)
-            results[i] = GenerationResult(
+            results[original_i] = GenerationResult(
                 text=text, token_ids=gen, stop_reason=stop_reasons[rid],
             )
         return results  # type: ignore[return-value]
@@ -565,11 +708,12 @@ class LLM:
                 roles_t = torch.tensor(
                     suffix_roles, dtype=torch.long, device=self.device,
                 )
-            logits, _ = self.model(
+            logits, _ = self._model_forward(
                 input_ids=suffix_t,
                 role_ids=roles_t,
                 cache=cache,
                 logits_to_keep=1,
+                step_type="prefill",
             )
             sampled, _ = inference.utils.sample(logits, temperature=temperature)
             for i, tok in enumerate(sampled.view(-1).tolist()):
@@ -603,11 +747,12 @@ class LLM:
                 roles_t = torch.tensor(
                     suffix_roles, dtype=torch.long, device=self.device,
                 )
-            logits, _ = self.model(
+            logits, _ = self._model_forward(
                 input_ids=suffix_t,
                 role_ids=roles_t,
                 cache=tmp,
                 logits_to_keep=1,
+                step_type="prefill",
             )
             sampled, _ = inference.utils.sample(logits, temperature=temperature)
             group_first = sampled.view(-1).tolist()

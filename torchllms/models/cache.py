@@ -429,6 +429,44 @@ class KVArena:
         return k_full, v_full
 
     @torch.no_grad()
+    def update_kv_decode_static(
+        self, layer_id: int, k_val: torch.Tensor, v_val: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode-only KV update with fixed output shapes.
+
+        This path is intended for ``torch.compile`` / CUDA graph experiments.
+        It avoids Python ``.item()`` conversions and returns the full static
+        per-layer cache plus tensor ``cache_seqlens``. Precondition: S == 1.
+        """
+        B = self.b_live
+        if k_val.shape[0] != B or v_val.shape[0] != B:
+            raise ValueError(
+                f"update_kv_decode_static expects batch={B}; "
+                f"got k={tuple(k_val.shape)} v={tuple(v_val.shape)}"
+            )
+        if k_val.shape != v_val.shape:
+            raise ValueError(
+                f"update_kv_decode_static k/v shape mismatch: "
+                f"k={tuple(k_val.shape)} v={tuple(v_val.shape)}"
+            )
+        if k_val.shape[1] != 1:
+            raise ValueError(
+                f"update_kv_decode_static requires S=1; got S={k_val.shape[1]}"
+            )
+
+        positions = self.seen_tokens[layer_id, :B]
+        rows = torch.arange(B, device=self.device)
+        self.k_cache[layer_id, rows, positions] = k_val[:, 0]
+        self.v_cache[layer_id, rows, positions] = v_val[:, 0]
+        cache_seqlens = positions + 1
+        self.seen_tokens[layer_id, :B] = cache_seqlens
+        return (
+            self.k_cache[layer_id, :B],
+            self.v_cache[layer_id, :B],
+            cache_seqlens,
+        )
+
+    @torch.no_grad()
     def update_role_ids(
         self, role_ids: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
