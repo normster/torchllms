@@ -1044,72 +1044,31 @@ def _bench_single(llm, engine, conv, max_new, tokenizer, config, label: str):
     )
 
 
-def run_throughput(llm, engine, prefix_cache, tokenizer, config):
-    print("\n" + "=" * 72)
-    print("THROUGHPUT")
-    print("=" * 72)
-    print("  Median of 3 trials, 1 warm-up. Prefill measured via max_new=1,")
-    print("  decode inferred from full_call - prefill_call.")
+def run_throughput(llm, engine, prefix_cache, tokenizer, config, *, compile_decode: bool = False):
+    """Qwen3 wrapper around the shared throughput bench.
 
-    print("\n  -- W1: short prompt + short completion --")
-    _bench_single(llm, engine, W1_CONV, W1_MAX_NEW, tokenizer, config, "short/short")
+    W1/W2/W3 workload definitions live in
+    ``torchllms.inference.throughput_bench``; this just wires in Qwen3's
+    template-config-based tokenization and Qwen3 stop tokens so gpt-oss
+    can use the same harness via Harmony tokenization.
+    """
+    from torchllms.inference import throughput_bench
 
-    print("\n  -- W2: short prompt + long completion --")
-    _bench_single(llm, engine, W2_CONV, W2_MAX_NEW, tokenizer, config, "short/long")
-
-    print("\n  -- W3: multiturn long/short (agentic, cache engaged) --")
-    prefix_cache.clear()
-    noop_prefix_cache = RadixKVCache(max_bytes=4 * 1024**3)
-    torchllms_turn_times = []
-    noop_turn_times = []
-    sglang_turn_times = []
-    noop_hook_calls = 0
-    for turn_idx in range(len(W3_TURNS)):
-        conv = _build_w3_history_to_turn(turn_idx + 1)
-        ids, roles = tokenize_conversation(
-            conv, tokenizer, config, add_generation_prompt=True,
+    def tokenize_fn(conv, add_generation_prompt):
+        return tokenize_conversation(
+            conv, tokenizer, config, add_generation_prompt=add_generation_prompt,
         )
-        # torchllms: RadixKVCache carried across turns. Total wallclock per
-        # turn = prefill (with possible cache hit) + decode.
-        t_out, t_wall, _ = _gen_torchllms_once_with_optional_noop(
-            llm,
-            ids,
-            roles,
-            80,
-            tokenizer,
-            prefix_cache=prefix_cache,
-            use_noop_hook=False,
-        )
-        tn_out, tn_wall, tn_calls = _gen_torchllms_once_with_optional_noop(
-            llm,
-            ids,
-            roles,
-            80,
-            tokenizer,
-            prefix_cache=noop_prefix_cache,
-            use_noop_hook=True,
-        )
-        # SGLang: default radix cache engaged, similar behavior.
-        s_out, s_wall = _gen_sglang_once(engine, ids, 80, tokenizer)
 
-        torchllms_turn_times.append((t_wall, len(t_out.token_ids)))
-        noop_turn_times.append((tn_wall, len(tn_out.token_ids)))
-        noop_hook_calls += tn_calls
-        sglang_turn_times.append((s_wall, len(s_out.token_ids)))
-        print(f"    turn {turn_idx}: prompt={len(ids)}t  "
-              f"torchllms={t_wall*1000:.0f}ms ({len(t_out.token_ids)}t out)  "
-              f"noop={tn_wall*1000:.0f}ms ({len(tn_out.token_ids)}t out)  "
-              f"sglang={s_wall*1000:.0f}ms ({len(s_out.token_ids)}t out)")
-
-    t_total = sum(w for w, _ in torchllms_turn_times)
-    tn_total = sum(w for w, _ in noop_turn_times)
-    s_total = sum(w for w, _ in sglang_turn_times)
-    print(f"\n    multiturn total wallclock: torchllms={t_total:.2f}s  sglang={s_total:.2f}s  "
-          f"sglang/torchllms speedup={t_total/s_total:.2f}x")
-    print(
-        f"    noop multiturn wallclock: torch+noop={tn_total:.2f}s  "
-        f"noop/torchllms time={tn_total/t_total:.2f}x  hook_calls={noop_hook_calls}"
+    throughput_bench.run_throughput(
+        llm, engine, tokenize_fn, tokenizer,
+        prefix_cache=prefix_cache,
+        model_label=f"Qwen3-4B ({PRECISION})",
+        stop_token_ids=list(STOP_TOKEN_IDS),
+        run_noop_hook=not compile_decode,  # noop hooks + compile = extra warmup churn; skip
+        trials=TRIALS, warmup=WARMUP,
+        compile_decode=compile_decode,
     )
+    return  # main() doesn't use the return value.
 
 
 # ---------------------------------------------------------------------------

@@ -24,9 +24,12 @@ from torchllms.models.networks import AttentionImpl
 
 
 def _is_gptoss_checkpoint(ckpt_paths: List[str]) -> bool:
-    """Heuristic: checkpoint dir contains a config.json with
-    architectures=["GptOssForCausalLM"]. Either the first path is the
-    directory itself, or it's a file whose parent has config.json.
+    """Heuristic: checkpoint dir contains a config.json that's either
+    HF-format (architectures=["GptOssForCausalLM"]) or openai's original
+    release format (no architectures field, but has the gpt-oss-specific
+    MoE fields: num_experts + experts_per_token + swiglu_limit). Either
+    the first path is the directory itself, or it's a file whose parent
+    has config.json.
     """
     if not ckpt_paths:
         return False
@@ -39,8 +42,16 @@ def _is_gptoss_checkpoint(ckpt_paths: List[str]) -> bool:
             cfg = json.load(f)
     except Exception:
         return False
-    archs = cfg.get("architectures", []) or []
-    return "GptOssForCausalLM" in archs
+    if "GptOssForCausalLM" in (cfg.get("architectures", []) or []):
+        return True
+    # Original-format fallback: no architectures field, but has the
+    # gpt-oss MoE signature. These three keys together are unique enough
+    # to disambiguate from other MoE checkpoints we care about.
+    return (
+        "num_experts" in cfg
+        and "experts_per_token" in cfg
+        and "swiglu_limit" in cfg
+    )
 
 
 def get_batches(iterable, n=1):
@@ -335,7 +346,12 @@ class LLM:
         # this prefix.
         self._insert_prefix_cache(cache, rid, prompt_tokens + generated_token_ids)
 
-        text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        # HF tokenizers accept skip_special_tokens; tiktoken (gpt-oss) doesn't.
+        # Fall back to the plain decode signature rather than failing.
+        try:
+            text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        except TypeError:
+            text = self.tokenizer.decode(list(generated_token_ids))
         return GenerationResult(
             text=text,
             token_ids=generated_token_ids,
@@ -631,7 +647,10 @@ class LLM:
             i = origin_of[rid]
             original_i = original_indices[i]
             gen = generated[rid]
-            text = self.tokenizer.decode(gen, skip_special_tokens=True)
+            try:
+                text = self.tokenizer.decode(gen, skip_special_tokens=True)
+            except TypeError:
+                text = self.tokenizer.decode(list(gen))
             results[original_i] = GenerationResult(
                 text=text, token_ids=gen, stop_reason=stop_reasons[rid],
             )
