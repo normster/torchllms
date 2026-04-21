@@ -71,14 +71,9 @@ class FakeTransformer(torch.nn.Module):
         logits_to_keep=None,
         attn_mask=None,
         input_pos=None,
-        use_kvcache_attn=False,
-        step_type="prefill",
     ):
         # The FakeTransformer doesn't actually do attention; it writes
-        # deterministic K/V and produces deterministic logits. The
-        # use_kvcache_attn flag is accepted for signature parity.
-        del use_kvcache_attn
-        del step_type
+        # deterministic K/V and produces deterministic logits.
         B, S = input_ids.shape
         self.forward_calls.append({"input_ids": input_ids.clone(), "seqlen": S})
 
@@ -132,6 +127,7 @@ class _FakeTokenizer:
 def _build_llm(model, prefix_cache=None, max_len=256, eos_ids=None) -> LLM:
     llm = LLM.__new__(LLM)
     llm.model = model
+    llm._compiled_decode_model = None
     llm.tokenizer = _FakeTokenizer()
     llm.template_config = None
     llm.max_len = max_len

@@ -48,7 +48,6 @@ def test_noop_intervention_hook_is_called_and_preserves_logits():
             {
                 "layer_id": ctx.layer_id,
                 "alpha": ctx.alpha,
-                "step_type": ctx.step_type,
                 "input_ids": ctx.input_ids.clone(),
                 "role_ids": ctx.role_ids.clone(),
             }
@@ -60,7 +59,6 @@ def test_noop_intervention_hook_is_called_and_preserves_logits():
 
     assert len(calls) == model.params.n_layers
     assert all(c["alpha"] is None for c in calls)
-    assert all(c["step_type"] == "prefill" for c in calls)
     assert torch.equal(calls[0]["input_ids"], input_ids)
     assert torch.equal(calls[0]["role_ids"], role_ids)
     assert torch.equal(base_logits, hooked_logits)
@@ -114,7 +112,6 @@ def test_vectorized_role_mask_edits_only_selected_positions():
     out = model._apply_activation_hooks(
         hidden,
         layer_id=0,
-        step_type="prefill",
         input_ids=input_ids,
         role_ids=role_ids,
         input_pos=input_pos,
@@ -142,7 +139,6 @@ def test_layer_specific_hook_edits_all_tokens_without_alpha_metadata():
     layer0 = model._apply_activation_hooks(
         hidden,
         layer_id=0,
-        step_type="prefill",
         input_ids=input_ids,
         role_ids=None,
         input_pos=None,
@@ -150,7 +146,6 @@ def test_layer_specific_hook_edits_all_tokens_without_alpha_metadata():
     layer1 = model._apply_activation_hooks(
         hidden,
         layer_id=1,
-        step_type="prefill",
         input_ids=input_ids,
         role_ids=None,
         input_pos=None,
@@ -172,7 +167,6 @@ def test_additive_vector_intervention_edits_selected_layer_all_tokens():
     layer0 = model._apply_activation_hooks(
         hidden,
         layer_id=0,
-        step_type="prefill",
         input_ids=input_ids,
         role_ids=None,
         input_pos=None,
@@ -180,7 +174,6 @@ def test_additive_vector_intervention_edits_selected_layer_all_tokens():
     layer1 = model._apply_activation_hooks(
         hidden,
         layer_id=1,
-        step_type="prefill",
         input_ids=input_ids,
         role_ids=None,
         input_pos=None,
@@ -216,7 +209,6 @@ def test_additive_vector_intervention_masks_by_role_and_position():
     out = model._apply_activation_hooks(
         hidden,
         layer_id=0,
-        step_type="prefill",
         input_ids=input_ids,
         role_ids=role_ids,
         input_pos=input_pos,
@@ -286,7 +278,7 @@ def test_no_cache_context_exposes_default_positions():
     assert len(calls) == 1
     assert torch.equal(
         calls[0],
-        torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long),
+        torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.int32),
     )
 
 
@@ -305,7 +297,6 @@ def test_partial_cache_prefill_context_exposes_only_active_suffix():
         role_ids=prefix_roles,
         cache=cache,
         logits_to_keep=1,
-        step_type="prefill",
     )
 
     calls = []
@@ -316,7 +307,6 @@ def test_partial_cache_prefill_context_exposes_only_active_suffix():
                 "input_ids": ctx.input_ids.clone(),
                 "role_ids": ctx.role_ids.clone(),
                 "input_pos": ctx.input_pos.clone(),
-                "step_type": ctx.step_type,
             }
         )
         return hidden
@@ -329,14 +319,12 @@ def test_partial_cache_prefill_context_exposes_only_active_suffix():
         role_ids=suffix_roles,
         cache=cache,
         logits_to_keep=1,
-        step_type="prefill",
     )
 
     assert len(calls) == 1
-    assert calls[0]["step_type"] == "prefill"
     assert torch.equal(calls[0]["input_ids"], suffix_ids)
     assert torch.equal(calls[0]["role_ids"], suffix_roles)
-    assert torch.equal(calls[0]["input_pos"], torch.tensor([[3, 4]]))
+    assert torch.equal(calls[0]["input_pos"], torch.tensor([[3, 4]], dtype=torch.int32))
 
 
 def test_decode_context_exposes_single_token_and_position():
@@ -357,7 +345,6 @@ def test_decode_context_exposes_single_token_and_position():
                 "input_ids": ctx.input_ids.clone(),
                 "role_ids": ctx.role_ids.clone(),
                 "input_pos": ctx.input_pos.clone(),
-                "step_type": ctx.step_type,
             }
         )
         return hidden
@@ -370,15 +357,13 @@ def test_decode_context_exposes_single_token_and_position():
         role_ids=decode_roles,
         cache=cache,
         logits_to_keep=1,
-        step_type="decode",
     )
 
     assert len(calls) == 1
     assert calls[0]["hidden_shape"] == (1, 1, model.params.dim)
-    assert calls[0]["step_type"] == "decode"
     assert torch.equal(calls[0]["input_ids"], decode_ids)
     assert torch.equal(calls[0]["role_ids"], decode_roles)
-    assert torch.equal(calls[0]["input_pos"], torch.tensor([[2]]))
+    assert torch.equal(calls[0]["input_pos"], torch.tensor([[2]], dtype=torch.int32))
 
 
 def test_activation_hook_must_preserve_shape():
@@ -394,7 +379,6 @@ def test_activation_hook_must_preserve_shape():
         model._apply_activation_hooks(
             hidden,
             layer_id=0,
-            step_type="prefill",
             input_ids=input_ids,
             role_ids=None,
             input_pos=None,

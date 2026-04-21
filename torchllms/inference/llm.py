@@ -7,7 +7,6 @@ But if you want to test out custom architectures or inference strategies, it's a
 """
 
 import gc
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -19,7 +18,7 @@ from torchllms.inference.prefix_cache import RadixKVCache
 from torchllms.messages import tokenization
 from torchllms.models import utils
 from torchllms.models.cache import RolloutId
-from torchllms.models.networks import AttentionImpl, flash_attn_with_kvcache
+from torchllms.models.networks import AttentionImpl
 
 
 def get_batches(iterable, n=1):
@@ -71,9 +70,6 @@ class LLM:
         model_kwargs: Optional[Dict[str, Any]] = None,
         batched: bool = False,
         prefix_cache: Optional[RadixKVCache] = None,
-        compile_model: Optional[bool] = None,
-        compile_mode: str = "reduce-overhead",
-        static_decode_kvcache: Optional[bool] = None,
     ):
         model, tokenizer, template_config = utils.setup_model_and_tokenizer(
             ckpt_paths,
@@ -85,10 +81,9 @@ class LLM:
         model.eval()
 
         self.model = model
-        self._compiled_model = None
+        # Decode-only torch.compile is kept as an opt-in experiment. Whole-
+        # model compile has never been the speed path and is not wired.
         self._compiled_decode_model = None
-        self._decode_compile_static_kvcache = False
-        self._static_decode_kvcache = False
         self.tokenizer = tokenizer
         self.template_config = template_config
         self.max_len = max_len
@@ -117,110 +112,50 @@ class LLM:
         self.eos_ids = list(eos_ids)
         self.eos_set = set(self.eos_ids)
 
-        if compile_model is None:
-            compile_model = os.environ.get("TORCHLLMS_COMPILE", "").lower() in {
-                "1", "true", "yes", "on",
-            }
-        if compile_model:
-            self.enable_compile(mode=compile_mode)
-        if static_decode_kvcache is None:
-            env_static_decode = os.environ.get("TORCHLLMS_STATIC_DECODE_KVCACHE")
-            if env_static_decode is None:
-                static_decode_kvcache = self._supports_static_decode_kvcache()
-            else:
-                static_decode_kvcache = env_static_decode.lower() in {
-                    "1", "true", "yes", "on",
-                }
-        if static_decode_kvcache:
-            self.enable_static_decode_kvcache()
-
-    def enable_compile(self, *, mode: str = "reduce-overhead") -> None:
-        """Compile the model forward path for decode-loop experiments.
-
-        Keep ``self.model`` as the original module so custom methods like
-        ``init_cache`` and ``set_activation_hooks`` remain directly available.
-        Generation calls route through ``self._compiled_model`` when present.
-        """
-        self._compiled_model = torch.compile(self.model, mode=mode)
-
-    def disable_compile(self) -> None:
-        self._compiled_model = None
-
     def enable_decode_compile(
         self,
         *,
         mode: str = "reduce-overhead",
-        static_kvcache_attn: bool = True,
+        recompile_limit: int = 128,
     ) -> None:
         """Compile only decode forwards.
 
-        Prefill remains eager to avoid variable prompt shapes. Decode can opt
-        into the static FA2 KV-cache path so the compiled body keeps fixed
-        cache tensor shapes while ``cache_seqlens`` carries the live length.
+        Prefill remains eager to avoid variable prompt shapes. Decode routes
+        through ``Attention``'s internal ``seqlen == 1`` fixed-shape path
+        automatically, so the compiled body keeps fixed cache tensor shapes.
+        Opt-in: not the default speed path. Use with the ``decode-compile``
+        validator phase to verify correctness and measure gain.
+
+        Bumps ``torch._dynamo.config.cache_size_limit`` to ``recompile_limit``
+        if currently lower. The default 8 is not enough headroom for a 36-
+        layer transformer where each ``TransformerBlock`` has its own
+        ``self.layer_id`` integer attribute triggering a separate Dynamo
+        specialization; varying prompt shapes across calls compound the
+        effect. 128 is comfortable for typical use; raise further if the
+        compile phase logs ``cache_size_limit reached`` warnings.
         """
+        import torch._dynamo as _dynamo
+        if _dynamo.config.cache_size_limit < recompile_limit:
+            _dynamo.config.cache_size_limit = recompile_limit
         self._compiled_decode_model = torch.compile(self.model, mode=mode)
-        self._decode_compile_static_kvcache = bool(static_kvcache_attn)
 
     def disable_decode_compile(self) -> None:
         self._compiled_decode_model = None
-        self._decode_compile_static_kvcache = False
-
-    def enable_static_decode_kvcache(self) -> None:
-        """Use the fixed-shape FA2 kvcache decode path without compiling."""
-        if not self._supports_static_decode_kvcache():
-            raise NotImplementedError(
-                "static decode kvcache requires the base Transformer with "
-                "AttentionImpl.FLASH and flash_attn_with_kvcache available"
-            )
-        self._static_decode_kvcache = True
-
-    def disable_static_decode_kvcache(self) -> None:
-        self._static_decode_kvcache = False
-
-    def _supports_static_decode_kvcache(self) -> bool:
-        params = getattr(self.model, "params", None)
-        if params is None:
-            return False
-        if getattr(params, "gpt_oss_arch", False) or getattr(params, "olmo2_arch", False):
-            return False
-        if getattr(params, "attention_impl", None) != AttentionImpl.FLASH:
-            return False
-        return flash_attn_with_kvcache is not None
-
-    def _prepare_static_decode_kwargs(self, kwargs):
-        cache = kwargs.get("cache")
-        role_ids = kwargs.get("role_ids")
-        attn_mask = kwargs.get("attn_mask")
-        if cache is not None:
-            if role_ids is not None:
-                cache.update_role_ids(role_ids)
-            if attn_mask is not None:
-                cache.update_attn_mask(attn_mask)
-        kwargs["static_kvcache_attn"] = True
-        kwargs["update_cache_metadata"] = False
-        kwargs["check_cache_full"] = False
-        kwargs["use_kvcache_attn"] = False
-        return kwargs
 
     def _model_forward(self, **kwargs):
-        if (
-            kwargs.get("step_type") == "decode"
-            and getattr(self, "_compiled_decode_model", None) is not None
-        ):
-            if self._decode_compile_static_kvcache:
-                kwargs = self._prepare_static_decode_kwargs(kwargs)
-            return self._compiled_decode_model(**kwargs)
-
-        if (
-            kwargs.get("step_type") == "decode"
-            and getattr(self, "_static_decode_kvcache", False)
-            and self._supports_static_decode_kvcache()
-        ):
-            kwargs = self._prepare_static_decode_kwargs(kwargs)
-
-        compiled_model = getattr(self, "_compiled_model", None)
-        model = compiled_model if compiled_model is not None else self.model
-        return model(**kwargs)
+        # Decode forwards (qlen == 1 with a cache) can route through the
+        # compiled model when enabled; everything else goes through the
+        # eager model.
+        if self._compiled_decode_model is not None:
+            input_ids = kwargs.get("input_ids")
+            cache = kwargs.get("cache")
+            if (
+                input_ids is not None
+                and input_ids.shape[1] == 1
+                and cache is not None
+            ):
+                return self._compiled_decode_model(**kwargs)
+        return self.model(**kwargs)
 
     def set_activation_hooks(self, hooks, *, alpha: Optional[float] = None) -> None:
         if not hasattr(self.model, "set_activation_hooks"):
@@ -320,7 +255,6 @@ class LLM:
             role_ids=suffix_roles,
             cache=cache,
             logits_to_keep=1,
-            step_type="prefill",
         )
         cur_token, _ = inference.utils.sample(logits, temperature=temperature)
 
@@ -335,7 +269,6 @@ class LLM:
                     role_ids=asst_role,
                     cache=cache,
                     logits_to_keep=1,
-                    step_type="decode",
                 )
                 cur_token, _ = inference.utils.sample(logits, temperature=temperature)
                 cur = int(cur_token.squeeze().item())
@@ -466,10 +399,11 @@ class LLM:
             load into the main arena.
 
         Decode:
-          - Uniform prompt lengths across all rows → fast
-            ``flash_attn_func`` path.
-          - Diverging prompt lengths → ``flash_attn_with_kvcache`` (FA2
-            kernel that masks each row to its own cache_seqlen).
+          - Every decode forward has seqlen == 1, so ``Attention.forward``
+            routes to the fixed-shape ``flash_attn_with_kvcache`` path,
+            which handles per-row diverging cache lengths via
+            ``cache_seqlens`` and keeps cache shapes stable across steps
+            (graph-capturable).
 
         Semantics:
           - Any-of stop: generation for a row stops on the first sampled
@@ -533,7 +467,6 @@ class LLM:
         B = len(prompt_token_lists)
 
         max_prompt_len = max(prompt_lens)
-        uniform_lens = len(set(prompt_lens)) == 1
         max_budget = max(budgets)
 
         # Per-row prefix-cache lookup. Leave ≥1 suffix token per row so the
@@ -595,14 +528,10 @@ class LLM:
         _retire_and_insert(to_retire_now)
 
         # ---- Decode ----
-        # Under diverging-length prefill, rows end at per-row seen_tokens =
-        # prompt_lens[i], so decode must route through flash_attn_with_kvcache
-        # for correct per-row masking. Under uniform prompt_lens the fast
-        # flash_attn_func path is correct. Prefix-cache hits don't affect
-        # the decode regime — every row ends prefill at prompt_len[i]
-        # regardless of where it started.
-        decode_use_kvcache_attn = not uniform_lens
-
+        # Every decode forward has seqlen == 1; ``Attention.forward``
+        # routes to the fixed-shape ``flash_attn_with_kvcache`` path
+        # internally, which handles per-row diverging cache lengths via
+        # ``cache_seqlens`` and keeps cache tensors at their full shape.
         asst_role_id = int(tokenization.Role.ASSISTANT)
         for _step in range(1, max_budget):
             if cache.b_live == 0:
@@ -626,8 +555,6 @@ class LLM:
                 role_ids=next_roles,
                 cache=cache,
                 logits_to_keep=1,
-                use_kvcache_attn=decode_use_kvcache_attn,
-                step_type="decode",
             )
             sampled, _ = inference.utils.sample(logits, temperature=temperature)
             new_tokens = sampled.view(-1).tolist()
@@ -713,7 +640,6 @@ class LLM:
                 role_ids=roles_t,
                 cache=cache,
                 logits_to_keep=1,
-                step_type="prefill",
             )
             sampled, _ = inference.utils.sample(logits, temperature=temperature)
             for i, tok in enumerate(sampled.view(-1).tolist()):
@@ -752,7 +678,6 @@ class LLM:
                 role_ids=roles_t,
                 cache=tmp,
                 logits_to_keep=1,
-                step_type="prefill",
             )
             sampled, _ = inference.utils.sample(logits, temperature=temperature)
             group_first = sampled.view(-1).tolist()

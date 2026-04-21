@@ -194,9 +194,26 @@ class KVArena:
         )
         self.is_attn_mask_cached = False
 
+        # seen_tokens lives as int32 so the per-row lengths it produces
+        # (row_positions, cache_seqlens for flash_attn_with_kvcache) can feed
+        # the decode kernel without an allocating dtype cast each step.
+        # max_seqlen is bounded well under 2**31 in any realistic config.
         self.seen_tokens = torch.zeros(
-            (n_layers, max_bsz), device=dev, dtype=torch.long
+            (n_layers, max_bsz), device=dev, dtype=torch.int32
         )
+
+        # Static address marking: these tensors are mutated in place during
+        # the compiled decode forward (update_kv_decode). Without this hint
+        # Inductor's cudagraph-safety check skips capture because it can't
+        # prove the mutated tensors won't move across calls. The KVArena
+        # never reallocates these buffers during its lifetime, so static
+        # addresses are accurate. Annotation is a no-op in eager mode.
+        # See: HF Transformers StaticCache, gpt-fast KVCache for precedent.
+        torch._dynamo.mark_static_address(self.k_cache)
+        torch._dynamo.mark_static_address(self.v_cache)
+        torch._dynamo.mark_static_address(self.seen_tokens)
+        torch._dynamo.mark_static_address(self.role_id_cache)
+        torch._dynamo.mark_static_address(self.attn_mask_cache)
 
         self.slot_to_rollout: List[RolloutId] = []
         self.rollout_to_slot: Dict[RolloutId, int] = {}
@@ -256,7 +273,7 @@ class KVArena:
                 f"per_row_lengths must have shape ({B},); got "
                 f"{tuple(per_row_lengths.shape)}"
             )
-        vals = per_row_lengths.to(device=self.device, dtype=torch.long)
+        vals = per_row_lengths.to(device=self.device, dtype=torch.int32)
         if bool((vals < 0).any().item()) or bool(
             (vals > self.max_seqlen).any().item()
         ):
@@ -429,42 +446,42 @@ class KVArena:
         return k_full, v_full
 
     @torch.no_grad()
-    def update_kv_decode_static(
+    def update_kv_decode(
         self, layer_id: int, k_val: torch.Tensor, v_val: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decode-only KV update with fixed output shapes.
+        """Decode-step KV update with fixed output shapes. Precondition: S == 1.
 
-        This path is intended for ``torch.compile`` / CUDA graph experiments.
-        It avoids Python ``.item()`` conversions and returns the full static
-        per-layer cache plus tensor ``cache_seqlens``. Precondition: S == 1.
+        Shape checks live here (cheap, eager path); the actual scatter is
+        dispatched to ``torchllms.models.compile_ops.update_kv_decode``, a
+        registered custom op with explicit ``mutates_args`` so Dynamo and
+        cudagraph capture don't graph-break or miss the in-place writes.
         """
         B = self.b_live
         if k_val.shape[0] != B or v_val.shape[0] != B:
             raise ValueError(
-                f"update_kv_decode_static expects batch={B}; "
+                f"update_kv_decode expects batch={B}; "
                 f"got k={tuple(k_val.shape)} v={tuple(v_val.shape)}"
             )
         if k_val.shape != v_val.shape:
             raise ValueError(
-                f"update_kv_decode_static k/v shape mismatch: "
+                f"update_kv_decode k/v shape mismatch: "
                 f"k={tuple(k_val.shape)} v={tuple(v_val.shape)}"
             )
         if k_val.shape[1] != 1:
             raise ValueError(
-                f"update_kv_decode_static requires S=1; got S={k_val.shape[1]}"
+                f"update_kv_decode requires S=1; got S={k_val.shape[1]}"
             )
 
-        positions = self.seen_tokens[layer_id, :B]
-        rows = torch.arange(B, device=self.device)
-        self.k_cache[layer_id, rows, positions] = k_val[:, 0]
-        self.v_cache[layer_id, rows, positions] = v_val[:, 0]
-        cache_seqlens = positions + 1
-        self.seen_tokens[layer_id, :B] = cache_seqlens
-        return (
-            self.k_cache[layer_id, :B],
-            self.v_cache[layer_id, :B],
-            cache_seqlens,
+        from torchllms.models import compile_ops
+        B = k_val.shape[0]
+        cache_seqlens = compile_ops.update_kv_decode(
+            self.k_cache, self.v_cache, self.seen_tokens,
+            layer_id, k_val, v_val,
         )
+        # The cache slabs are sliced outside the custom op — torch.library
+        # forbids the op from returning tensors that alias its inputs, so
+        # the op mutates in place and returns only the fresh cache_seqlens.
+        return self.k_cache[layer_id, :B], self.v_cache[layer_id, :B], cache_seqlens
 
     @torch.no_grad()
     def update_role_ids(

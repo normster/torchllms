@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from pydantic import BaseModel
 
 from torchllms.messages import Role
-from torchllms.models import utils
+from torchllms.models import compile_ops, utils
 from torchllms.models.cache import KVArena
 
 
@@ -48,12 +48,13 @@ class HookContext:
     """Metadata passed to activation-intervention hooks.
 
     All tensor fields describe only the active tokens in the current forward
-    call. Cached-prefix positions are intentionally not exposed here.
+    call. Cached-prefix positions are intentionally not exposed here. Hooks
+    that need to distinguish prefill from decode can check
+    ``input_ids.shape[1]``: decode always passes ``T_active == 1``.
     """
 
     layer_id: int
     site: Literal["post_block"]
-    step_type: Literal["prefill", "decode"]
     input_ids: torch.Tensor
     role_ids: Optional[torch.Tensor]
     input_pos: Optional[torch.Tensor]
@@ -368,34 +369,6 @@ def _flash_attention(xq: torch.Tensor, xk: torch.Tensor, xv: torch.Tensor):
     return output
 
 
-def _flash_attention_with_kvcache(
-    xq: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-):
-    """Decode against a KV cache with per-row valid lengths.
-
-    xq:          [B, qlen, n_heads, head_dim]
-    k_cache/v_cache: [B, max_seqlen, n_kv_heads, head_dim] — the ENTIRE
-        cache for this layer, including positions beyond each row's valid
-        end (those positions may be stale/zero).
-    cache_seqlens: int64 [B] — per-row number of valid positions in the
-        cache. Row i attends to k_cache[i, :cache_seqlens[i]].
-
-    Used for batched decode when rows have diverged prompt lengths or
-    post-retirement slot shifts. For uniform cache_seqlens plus qlen==1,
-    ``_flash_attention`` on ``k_cache[:, :seqlen]`` is equivalent and
-    slightly faster — callers should prefer that when possible.
-    """
-    bsz, qlen, n_heads, head_dim = xq.shape
-    dim = n_heads * head_dim
-    output = flash_attn_with_kvcache(
-        xq, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=True,
-    )
-    return output.reshape(bsz, qlen, dim)
-
-
 def _sdpa_attention(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -497,8 +470,6 @@ class Attention(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[KVArena] = None,
         attn_mask: Optional[torch.Tensor] = None,
-        use_kvcache_attn: bool = False,
-        static_kvcache_attn: bool = False,
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -514,39 +485,35 @@ class Attention(nn.Module):
         xq = self.rope(xq, input_pos=input_pos)
         xk = self.rope(xk, input_pos=input_pos)
 
-        cache_seqlens = None
-        if cache is not None and static_kvcache_attn:
-            assert flash_attn_with_kvcache is not None, (
-                "static_kvcache_attn requires flash_attn installed"
-            )
-            xk, xv, cache_seqlens = cache.update_kv_decode_static(
+        # Decode-step fast path: qlen == 1 with FA2 available. The KV
+        # scatter + attention both run through torch.library-registered
+        # custom ops in ``torchllms.models.compile_ops`` so Dynamo can
+        # trace and cudagraph-capture the call sequence. Cache tensors
+        # keep their full [B, max_seqlen, ...] shape across steps.
+        # Everything else (prefill, SDPA, eager, no cache) takes the
+        # slice-returning ``update_kv`` + dispatch-by-attention-impl path.
+        if (
+            cache is not None
+            and seqlen == 1
+            and self.params.attention_impl == AttentionImpl.FLASH
+            and compile_ops.fa_with_kvcache is not None
+        ):
+            xk, xv, cache_seqlens = cache.update_kv_decode(
                 self.layer_id, xk, xv,
             )
-        elif cache is not None:
-            xk, xv = cache.update_kv(self.layer_id, xk, xv)
-
-        if static_kvcache_attn:
-            assert cache_seqlens is not None
-            output = _flash_attention_with_kvcache(
-                xq, xk, xv, cache_seqlens.to(torch.int32),
-            )
-        elif use_kvcache_attn:
-            # Per-row diverging cache lengths: route to flash_attn_with_kvcache.
-            # Requires flash_attn and a cache to read seen_tokens from.
-            assert cache is not None and flash_attn_with_kvcache is not None, (
-                "use_kvcache_attn requires a cache and flash_attn installed"
-            )
-            cache_seqlens = cache.seen_tokens[self.layer_id, : xq.shape[0]]
-            output = _flash_attention_with_kvcache(
-                xq, xk, xv, cache_seqlens.to(torch.int32),
-            )
-        elif self.params.attention_impl == AttentionImpl.FLASH:
-            assert attn_mask is None
-            output = _flash_attention(xq, xk, xv)
-        elif self.params.attention_impl == AttentionImpl.SDPA:
-            output = _sdpa_attention(xq, xk, xv, attn_mask)
+            bsz_, qlen_, n_heads_, head_dim_ = xq.shape
+            out_4d = compile_ops.fa_with_kvcache(xq, xk, xv, cache_seqlens)
+            output = out_4d.reshape(bsz_, qlen_, n_heads_ * head_dim_)
         else:
-            output = _eager_attention(xq, xk, xv, attn_mask)
+            if cache is not None:
+                xk, xv = cache.update_kv(self.layer_id, xk, xv)
+            if self.params.attention_impl == AttentionImpl.FLASH:
+                assert attn_mask is None
+                output = _flash_attention(xq, xk, xv)
+            elif self.params.attention_impl == AttentionImpl.SDPA:
+                output = _sdpa_attention(xq, xk, xv, attn_mask)
+            else:
+                output = _eager_attention(xq, xk, xv, attn_mask)
 
         return self.wo(output)
 
@@ -623,8 +590,6 @@ class TransformerBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[KVArena] = None,
-        use_kvcache_attn: bool = False,
-        static_kvcache_attn: bool = False,
     ):
         h = x + self.attention(
             x=self.attention_norm(x),
@@ -632,8 +597,6 @@ class TransformerBlock(nn.Module):
             attn_mask=attn_mask,
             input_pos=input_pos,
             cache=cache,
-            use_kvcache_attn=use_kvcache_attn,
-            static_kvcache_attn=static_kvcache_attn,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -716,7 +679,6 @@ class Transformer(nn.Module):
         hidden: torch.Tensor,
         *,
         layer_id: int,
-        step_type: Literal["prefill", "decode"],
         input_ids: torch.Tensor,
         role_ids: Optional[torch.Tensor],
         input_pos: Optional[torch.Tensor],
@@ -727,7 +689,6 @@ class Transformer(nn.Module):
         ctx = HookContext(
             layer_id=layer_id,
             site="post_block",
-            step_type=step_type,
             input_ids=input_ids,
             role_ids=role_ids,
             input_pos=input_pos,
@@ -777,11 +738,6 @@ class Transformer(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[KVArena] = None,
         logits_to_keep: Optional[int] = None,
-        use_kvcache_attn: bool = False,
-        static_kvcache_attn: bool = False,
-        update_cache_metadata: bool = True,
-        check_cache_full: bool = True,
-        step_type: Literal["prefill", "decode"] = "prefill",
     ):
         """
         Apply a single forward pass for training or inference (prefill + decoding).
@@ -808,6 +764,12 @@ class Transformer(nn.Module):
         `input_pos` for the first prefill step. Decoding steps will automatically
         extend both if not provided.
 
+        Attention-kernel routing happens inside ``Attention.forward``: decode
+        steps (``seqlen == 1`` with a cache and FA2 available) take the
+        fixed-shape ``flash_attn_with_kvcache`` path; everything else routes
+        through ``update_kv`` + dispatch by ``attention_impl``. KV-cache
+        budget tracking is the caller's responsibility.
+
         Default behaviors:
         - Missing `role_ids` skips role embeddings.
         - Missing `attn_mask` attends to all tokens autoregressively.
@@ -815,21 +777,18 @@ class Transformer(nn.Module):
         - Missing `cache` skips reading/writing past key/value vectors and role IDs.
         """
 
-        if check_cache_full:
-            assert (
-                cache is None or not cache.is_full()
-            ), "Maximum sequence length reached, KV cache is full"
-
         # RoPE assumes [0, 1, 2, ...] input_pos when not provided, offset by
         # each row's current absolute position (derived from seen_tokens).
+        # seen_tokens is int32, so keep the arange int32 to avoid an upcast.
         if input_pos is None and cache is not None:
-            input_pos = torch.arange(input_ids.shape[1])[None, :]
-            input_pos = input_pos.to(input_ids.device) + cache.row_positions[:, None]
+            input_pos = torch.arange(
+                input_ids.shape[1], dtype=torch.int32, device=input_ids.device,
+            )[None, :] + cache.row_positions[:, None]
 
         context_input_pos = input_pos
         if context_input_pos is None:
             context_input_pos = torch.arange(
-                input_ids.shape[1], device=input_ids.device,
+                input_ids.shape[1], dtype=torch.int32, device=input_ids.device,
             )[None, :].expand(input_ids.shape[0], -1)
         elif context_input_pos.dim() == 1:
             context_input_pos = context_input_pos[None, :].expand(
@@ -842,24 +801,15 @@ class Transformer(nn.Module):
             h += self.role_embeddings(role_ids)
 
         active_role_ids = role_ids
-        if cache is not None and update_cache_metadata:
+        if cache is not None:
             role_ids = cache.update_role_ids(role_ids)
             attn_mask = cache.update_attn_mask(attn_mask)
 
         for i, layer in enumerate(self.layers):
-            h = layer(
-                h,
-                role_ids,
-                attn_mask,
-                input_pos,
-                cache,
-                use_kvcache_attn,
-                static_kvcache_attn=static_kvcache_attn,
-            )
+            h = layer(h, role_ids, attn_mask, input_pos, cache)
             h = self._apply_activation_hooks(
                 h,
                 layer_id=i,
-                step_type=step_type,
                 input_ids=input_ids,
                 role_ids=active_role_ids,
                 input_pos=context_input_pos,

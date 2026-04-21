@@ -461,12 +461,7 @@ class GptOSSTransformerBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[KVArena] = None,
-        use_kvcache_attn: bool = False,
     ):
-        # GptOSS uses a custom triton attention kernel that doesn't yet
-        # support per-row diverging cache lengths via flash_attn_with_kvcache.
-        # The flag is accepted for signature parity with the base block.
-        del use_kvcache_attn
         x = x + self.attn(x, role_ids, input_pos, cache, attn_mask)
         x = self.mlp(x)
         return x
@@ -535,26 +530,16 @@ class GptOSSTransformer(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[KVArena] = None,
         logits_to_keep: Optional[int] = None,
-        use_kvcache_attn: bool = False,
-        step_type: str = "prefill",
     ):
-        del step_type
-        # use_kvcache_attn is accepted for signature parity with the base
-        # Transformer, but the current gpt-oss attention kernel only accepts
-        # one scalar start_q shared across the batch. Diverging cache lengths
-        # must be implemented explicitly before this path can be used.
-        if use_kvcache_attn:
-            raise NotImplementedError(
-                "gpt-oss batched decode with diverging cache lengths is not "
-                "supported by the current single-start_q attention kernel"
-            )
-        assert (
-            cache is None or not cache.is_full()
-        ), "Maximum sequence length reached, KV cache is full"
+        # gpt-oss uses a custom triton attention kernel with a single scalar
+        # start_q shared across the batch. Diverging per-row cache lengths
+        # are not supported today; callers must keep batched decode on
+        # uniform prompt lengths (or use _generate_single).
 
         if input_pos is None and cache is not None:
-            input_pos = torch.arange(input_ids.shape[1])[None, :]
-            input_pos = input_pos.to(input_ids.device) + cache.row_positions[:, None]
+            input_pos = torch.arange(
+                input_ids.shape[1], dtype=torch.int32, device=input_ids.device,
+            )[None, :] + cache.row_positions[:, None]
 
         h = self.tok_embeddings(input_ids)
 
