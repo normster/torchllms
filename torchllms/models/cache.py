@@ -496,6 +496,35 @@ class KVArena:
             )
         S = role_ids.shape[1]
         positions = self.seen_tokens[0, :B]
+
+        if S == 1:
+            # Decode-step fast path. The scatter is wrapped in a registered
+            # ``torchllms::update_role_ids_decode`` custom op so Dynamo +
+            # Inductor treat ``role_id_cache`` as a side-effecting buffer;
+            # an inline scatter whose result isn't consumed in the output
+            # graph would be elided as dead code, leaving stale state for
+            # subsequent decode steps. Bounds check is skipped under
+            # torch.compile; the caller is responsible for respecting
+            # max_seqlen (same convention as ``update_kv_decode``).
+            from torchllms.models import compile_ops
+            if not torch.compiler.is_compiling():
+                if bool((positions + 1 > self.max_seqlen).any().item()):
+                    raise RuntimeError(
+                        f"update_role_ids would exceed max_seqlen: "
+                        f"positions={positions.tolist()} S=1"
+                    )
+            compile_ops.update_role_ids_decode(
+                self.role_id_cache, self.seen_tokens, role_ids,
+            )
+            # Under compile we return None (dynamic-shape slicing would
+            # fight Dynamo's shape specialization); in eager we return the
+            # full history slice callers have historically received.
+            if torch.compiler.is_compiling():
+                return None
+            max_end = int(positions.max().item()) + 1
+            return self.role_id_cache[:B, :max_end]
+
+        # Prefill path (S > 1): eager, unchanged.
         if bool((positions + S > self.max_seqlen).any().item()):
             raise RuntimeError(
                 f"update_role_ids would exceed max_seqlen: "
@@ -520,9 +549,17 @@ class KVArena:
         if attn_mask is None:
             if not self.is_attn_mask_cached or B == 0:
                 return None
+            # Auto-extend path via registered custom op so Inductor tracks
+            # the mutation of ``attn_mask_cache``. Without the op boundary
+            # the scatter can be elided as dead code when the caller
+            # (attention) doesn't consume the cache slice in the graph.
+            from torchllms.models import compile_ops
+            compile_ops.extend_attn_mask_decode(
+                self.attn_mask_cache, self.seen_tokens, B,
+            )
+            if torch.compiler.is_compiling():
+                return None
             positions = self.seen_tokens[0, :B]
-            rows = torch.arange(B, device=self.device)
-            self.attn_mask_cache[rows, positions] = 1
             max_end = int(positions.max().item()) + 1
             return self.attn_mask_cache[:B, :max_end]
 
@@ -532,6 +569,31 @@ class KVArena:
             )
         S = attn_mask.shape[1]
         positions = self.seen_tokens[0, :B]
+
+        if S == 1:
+            # Decode-step fast path (provided mask). Wraps the scatter in a
+            # ``torchllms::update_attn_mask_decode`` custom op so Inductor
+            # treats ``attn_mask_cache`` as a mutated buffer. Writing
+            # ``is_attn_mask_cached = True`` is a Python-side-effect on a
+            # non-Module, which Dynamo can't trace; we only toggle the
+            # flag off the compile path.
+            from torchllms.models import compile_ops
+            if not torch.compiler.is_compiling():
+                if bool((positions + 1 > self.max_seqlen).any().item()):
+                    raise RuntimeError(
+                        f"update_attn_mask would exceed max_seqlen: "
+                        f"positions={positions.tolist()} S=1"
+                    )
+                self.is_attn_mask_cached = True
+            compile_ops.update_attn_mask_decode(
+                self.attn_mask_cache, self.seen_tokens, attn_mask,
+            )
+            if torch.compiler.is_compiling():
+                return None
+            max_end = int(positions.max().item()) + 1
+            return self.attn_mask_cache[:B, :max_end]
+
+        # Prefill path (S > 1): eager, unchanged.
         if bool((positions + S > self.max_seqlen).any().item()):
             raise RuntimeError(
                 f"update_attn_mask would exceed max_seqlen: "

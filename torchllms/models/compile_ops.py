@@ -111,3 +111,86 @@ def update_kv_decode(
 def _(k_cache, v_cache, seen_tokens, layer_id, k_val, v_val):
     B = k_val.shape[0]
     return torch.empty((B,), dtype=torch.int32, device=k_cache.device)
+
+
+# =====================================================================
+# Decode-step role_id / attn_mask scatters (mutate aux caches)
+# =====================================================================
+#
+# The same pattern as ``update_kv_decode``, but for the role-id and
+# attention-mask scratch buffers threaded through the forward by
+# ``KVArena.update_role_ids`` / ``update_attn_mask``. Without the
+# ``mutates_args`` annotation, Inductor can observe that the scatter's
+# result isn't consumed by the output graph (Qwen3/gpt-oss attention
+# doesn't read these buffers) and elide the write as dead code, leaving
+# subsequent steps reading stale state. Wrapping the scatter in a custom
+# op tells Dynamo + Inductor the buffer IS mutated, preserving the
+# invariant even when the result isn't used in the graph's output.
+#
+# Shape of role_id_cache: [max_bsz, max_seqlen], dtype=long (usually).
+# Shape of attn_mask_cache: [max_bsz, max_seqlen], dtype=long.
+
+
+@custom_op(
+    "torchllms::update_role_ids_decode",
+    mutates_args={"role_id_cache"},
+)
+def update_role_ids_decode(
+    role_id_cache: Tensor,   # [max_bsz, max_seqlen]
+    seen_tokens: Tensor,     # [n_layers, max_bsz], int32
+    role_ids: Tensor,        # [B, 1]
+) -> None:
+    B = role_ids.shape[0]
+    positions = seen_tokens[0, :B]
+    rows = torch.arange(B, device=role_id_cache.device, dtype=positions.dtype)
+    role_id_cache[rows, positions] = role_ids[:, 0]
+
+
+@update_role_ids_decode.register_fake
+def _(role_id_cache, seen_tokens, role_ids):
+    return None
+
+
+@custom_op(
+    "torchllms::update_attn_mask_decode",
+    mutates_args={"attn_mask_cache"},
+)
+def update_attn_mask_decode(
+    attn_mask_cache: Tensor,  # [max_bsz, max_seqlen]
+    seen_tokens: Tensor,      # [n_layers, max_bsz], int32
+    attn_mask: Tensor,        # [B, 1]
+) -> None:
+    B = attn_mask.shape[0]
+    positions = seen_tokens[0, :B]
+    rows = torch.arange(B, device=attn_mask_cache.device, dtype=positions.dtype)
+    attn_mask_cache[rows, positions] = attn_mask[:, 0]
+
+
+@update_attn_mask_decode.register_fake
+def _(attn_mask_cache, seen_tokens, attn_mask):
+    return None
+
+
+@custom_op(
+    "torchllms::extend_attn_mask_decode",
+    mutates_args={"attn_mask_cache"},
+)
+def extend_attn_mask_decode(
+    attn_mask_cache: Tensor,  # [max_bsz, max_seqlen]
+    seen_tokens: Tensor,      # [n_layers, max_bsz], int32
+    b_live: int,
+) -> None:
+    """Auto-extend path (update_attn_mask(None) with is_attn_mask_cached):
+    write ``1`` into each row's current seen_tokens position.
+    """
+    B = b_live
+    if B == 0:
+        return
+    positions = seen_tokens[0, :B]
+    rows = torch.arange(B, device=attn_mask_cache.device, dtype=positions.dtype)
+    attn_mask_cache[rows, positions] = 1
+
+
+@extend_attn_mask_decode.register_fake
+def _(attn_mask_cache, seen_tokens, b_live):
+    return None
