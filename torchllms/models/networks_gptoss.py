@@ -22,8 +22,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchllms.models.attention_gptoss import attention as triton_attention
-from torchllms.models.attention_gptoss import attention_ref
+# The custom triton attention kernel in torchllms.models.attention_gptoss
+# is superseded by flashinfer's BatchAttentionWithAttentionSinkWrapper
+# (see torchllms.models.flashinfer_attention). attention_ref is still kept
+# as a dense reference used by smoke / test scripts but is not called
+# inside the production forward path.
 from torchllms.models.cache import KVArena
 from torchllms.models.networks import (
     ModelParams,
@@ -200,6 +203,7 @@ class GptOSSAttention(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[KVArena] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        sink_ctx=None,
     ):
         bsz, seqlen, _ = x.shape
 
@@ -217,36 +221,38 @@ class GptOSSAttention(nn.Module):
         q = self.rope(q, input_pos=input_pos)
         k = self.rope(k, input_pos=input_pos)
 
-        # Compute start_q for the attention kernel (position of first query
-        # token). The triton kernel asserts len(start_q) == 1, so this is a
-        # single scalar shared across batch rows — callers with diverging
-        # per-row positions must not use the fused kernel path.
-        if input_pos is not None:
-            start_q = input_pos[:1, 0].to(torch.long)
-        elif cache is not None:
-            start_q = cache.row_positions[:1].to(torch.long)
-        else:
-            start_q = torch.zeros(1, dtype=torch.long, device=x.device)
-
-        if cache is not None:
-            k, v = cache.update_kv(self.layer_id, k, v)
-
-        # GQA: reshape q to [bsz, seqlen, n_kv_heads, q_per_kv, head_dim]
-        q_per_kv = self.n_heads // self.n_kv_heads
-        q = q.view(bsz, seqlen, self.n_kv_heads, q_per_kv, self.head_dim)
-
-        # Triton kernel for prefill (seqlen >= 64), eager ref for decode
-        if seqlen >= 64 and x.is_cuda:
-            output = triton_attention(
-                q, k, v, self.sinks, self.sm_scale,
-                self.sliding_window, start_q,
+        if cache is None:
+            raise RuntimeError(
+                "GptOSSAttention.forward requires a KVArena cache "
+                "(flashinfer paged attention has no dense-KV variant)"
             )
-        else:
-            output = attention_ref(
-                q, k, v, self.sinks, self.sm_scale,
-                self.sliding_window, start_q,
+        if sink_ctx is None:
+            raise RuntimeError(
+                "GptOSSAttention.forward requires sink_ctx from "
+                "GptOSSTransformer.forward's build_sink_context call"
             )
 
+        # Write new K/V into the cache. KVArena.update_kv advances
+        # seen_tokens[self.layer_id] by S; its returned k/v slices we
+        # discard — flashinfer reads the updated slab directly.
+        cache.update_kv(self.layer_id, k, v)
+
+        # flashinfer sink attention via the pre-planned wrappers. Q is flat
+        # [B * S, n_heads, head_dim]; k/v cache slabs are the KVArena
+        # layer's [max_bsz, max_seqlen, n_kv_heads, head_dim] tensors
+        # (paged view: 1 page per sequence, page_size = max_seqlen).
+        from torchllms.models.flashinfer_attention import run_sink_attention
+
+        q_flat = q.reshape(bsz * seqlen, self.n_heads, self.head_dim)
+        output_flat = run_sink_attention(
+            ctx=sink_ctx,
+            q=q_flat,
+            k_cache_layer=cache.k_cache[self.layer_id],
+            v_cache_layer=cache.v_cache[self.layer_id],
+            sinks=self.sinks,
+            layer_sliding_window=self.sliding_window,
+        )
+        output = output_flat.reshape(bsz, seqlen, self.n_heads * self.head_dim)
         return self.out(output)
 
 
@@ -461,8 +467,9 @@ class GptOSSTransformerBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         cache: Optional[KVArena] = None,
+        sink_ctx=None,  # FlashinferSinkContext; required when cache is not None
     ):
-        x = x + self.attn(x, role_ids, input_pos, cache, attn_mask)
+        x = x + self.attn(x, role_ids, input_pos, cache, attn_mask, sink_ctx=sink_ctx)
         x = self.mlp(x)
         return x
 
@@ -531,12 +538,19 @@ class GptOSSTransformer(nn.Module):
         cache: Optional[KVArena] = None,
         logits_to_keep: Optional[int] = None,
     ):
-        # gpt-oss uses a custom triton attention kernel with a single scalar
-        # start_q shared across the batch. Diverging per-row cache lengths
-        # are not supported today; callers must keep batched decode on
-        # uniform prompt lengths (or use _generate_single).
+        # Attention is handled via flashinfer's
+        # BatchAttentionWithAttentionSinkWrapper. Plan the sink context once
+        # here (same layout serves all layers), then pass it through the
+        # layer loop. Sliding / full wrappers are both planned; each
+        # attention layer picks based on its own ``sliding_window`` config.
 
-        if input_pos is None and cache is not None:
+        if cache is None:
+            raise RuntimeError(
+                "GptOSSTransformer.forward currently requires a cache; "
+                "flashinfer paged attention has no dense-KV variant."
+            )
+
+        if input_pos is None:
             input_pos = torch.arange(
                 input_ids.shape[1], dtype=torch.int32, device=input_ids.device,
             )[None, :] + cache.row_positions[:, None]
@@ -550,8 +564,34 @@ class GptOSSTransformer(nn.Module):
             role_ids = cache.update_role_ids(role_ids)
             attn_mask = cache.update_attn_mask(attn_mask)
 
+        # Build the flashinfer sink context once per forward. All layers
+        # share it — we plan both full + sliding wrappers for this layout.
+        from torchllms.models.flashinfer_attention import build_sink_context
+        from torchllms.messages.tokenization import Role  # noqa: F401 — avoid circular at import time
+
+        B = input_ids.shape[0]
+        S = input_ids.shape[1]
+        # seen_tokens[0] is the pre-write KV length (S7: layers equal between
+        # forwards). Post-write length = pre + S.
+        pre_write_seqlens = cache.seen_tokens[0, :B]
+        post_write_seqlens = pre_write_seqlens + S
+
+        head_dim = self.params.head_dim
+        sink_ctx = build_sink_context(
+            device=input_ids.device,
+            dtype=self.tok_embeddings.weight.dtype,
+            head_dim=head_dim,
+            n_heads=self.params.n_heads,
+            n_kv_heads=self.params.n_kv_heads,
+            sliding_window=self.params.gpt_oss_sliding_window,
+            post_write_seqlens=post_write_seqlens,
+            new_query_len=S,
+            max_seqlen=cache.max_seqlen,
+            sm_scale=head_dim ** -0.5,
+        )
+
         for layer in self.layers:
-            h = layer(h, role_ids, attn_mask, input_pos, cache)
+            h = layer(h, role_ids, attn_mask, input_pos, cache, sink_ctx)
 
         if logits_to_keep is not None:
             h = h[:, -logits_to_keep:]

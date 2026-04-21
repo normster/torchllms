@@ -7,7 +7,9 @@ But if you want to test out custom architectures or inference strategies, it's a
 """
 
 import gc
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -19,6 +21,26 @@ from torchllms.messages import tokenization
 from torchllms.models import utils
 from torchllms.models.cache import RolloutId
 from torchllms.models.networks import AttentionImpl
+
+
+def _is_gptoss_checkpoint(ckpt_paths: List[str]) -> bool:
+    """Heuristic: checkpoint dir contains a config.json with
+    architectures=["GptOssForCausalLM"]. Either the first path is the
+    directory itself, or it's a file whose parent has config.json.
+    """
+    if not ckpt_paths:
+        return False
+    p = Path(ckpt_paths[0])
+    cfg_path = p / "config.json" if p.is_dir() else p.parent / "config.json"
+    if not cfg_path.exists():
+        return False
+    try:
+        with cfg_path.open() as f:
+            cfg = json.load(f)
+    except Exception:
+        return False
+    archs = cfg.get("architectures", []) or []
+    return "GptOssForCausalLM" in archs
 
 
 def get_batches(iterable, n=1):
@@ -71,13 +93,34 @@ class LLM:
         batched: bool = False,
         prefix_cache: Optional[RadixKVCache] = None,
     ):
-        model, tokenizer, template_config = utils.setup_model_and_tokenizer(
-            ckpt_paths,
-            template_config=template_config,
-            device=device,
-            precision=precision,
-            model_kwargs=model_kwargs,
-        )
+        # Detect gpt-oss checkpoints (HF safetensors + config.json with
+        # architectures=["GptOssForCausalLM"]) and route to setup_gptoss,
+        # which handles MXFP4 MoE decode + Harmony tokenization.
+        # Everything else (Qwen3, Llama, OLMo, etc.) flows through the
+        # torchllms-native setup_model_and_tokenizer path.
+        if _is_gptoss_checkpoint(ckpt_paths):
+            from torchllms.models.weights_gptoss import setup_gptoss
+            ckpt_dir = str(Path(ckpt_paths[0]).parent if Path(ckpt_paths[0]).is_file()
+                           else Path(ckpt_paths[0]))
+            model, tokenizer, template_config_loaded = setup_gptoss(
+                ckpt_dir,
+                device=device,
+                max_seq_len=(model_kwargs or {}).get("max_seq_len"),
+                mxfp4=(model_kwargs or {}).get("mxfp4", True),
+            )
+            # setup_gptoss returns template_config=None; if caller supplied
+            # one explicitly leave it, else keep None (Harmony path is
+            # handled by the runner via tokenize_harmony_conversation).
+            if template_config is None:
+                template_config = template_config_loaded
+        else:
+            model, tokenizer, template_config = utils.setup_model_and_tokenizer(
+                ckpt_paths,
+                template_config=template_config,
+                device=device,
+                precision=precision,
+                model_kwargs=model_kwargs,
+            )
         model.eval()
 
         self.model = model
@@ -221,8 +264,10 @@ class LLM:
         else:
             asst_role = None
 
-        max_cache_len = prompt_len + max_new_tokens_
-        cache = self.model.init_cache(1, self.device, max_cache_len=max_cache_len)
+        # Fixed max_cache_len = self.max_len (same rationale as
+        # _generate_multiple): stable cache tensor shape across calls so
+        # decode-compile doesn't recompile per-call.
+        cache = self.model.init_cache(1, self.device, max_cache_len=self.max_len)
         rid = cache.claim()
 
         # --- Prefix cache lookup -------------------------------------------
@@ -485,8 +530,17 @@ class LLM:
                         prefill_starts[i] = ps
                         prefix_chunks[i] = chunk
 
-        max_cache_len = max_prompt_len + max_budget
-        cache = self.model.init_cache(B, self.device, max_cache_len=max_cache_len)
+        # Use a FIXED max_cache_len = self.max_len so every call to
+        # _generate_multiple allocates a cache of identical shape. This is
+        # load-bearing for decode-compile: Dynamo specializes on input
+        # tensor shapes, so a cache whose seqlen dim varies per wave (as
+        # the previous adaptive `max_prompt_len + max_budget` did) forces
+        # recompilation on every wave, hanging the run. Trade-off: extra
+        # KV memory proportional to self.max_len - (max_prompt_len +
+        # max_budget). For Qwen3-4B bf16 at max_len=40960, batch=4 this
+        # is ~8 GB of extra allocation vs adaptive, which fits on a 32 GB
+        # GPU. Shrink --max-seq-len if memory is tight.
+        cache = self.model.init_cache(B, self.device, max_cache_len=self.max_len)
 
         rids: List[RolloutId] = [cache.claim() for _ in range(B)]
         origin_of: Dict[RolloutId, int] = {rid: i for i, rid in enumerate(rids)}
