@@ -28,6 +28,7 @@ import torch.nn.functional as F
 # as a dense reference used by smoke / test scripts but is not called
 # inside the production forward path.
 from torchllms.models.networks import (
+    InterventionHost,
     ModelParams,
     RMSNorm,
     RoleEmbeddings,
@@ -615,11 +616,17 @@ class GptOSSTransformerBlock(nn.Module):
         return x
 
 
-class GptOSSTransformer(nn.Module):
+class GptOSSTransformer(InterventionHost, nn.Module):
     """GPT-OSS MoE Transformer matching the torchllms Transformer interface.
 
     Weight names use gpt-oss conventions (embedding, block, unembedding) to
     align with the SafeTensors checkpoint format.
+
+    Inherits the activation-intervention API (``register_intervention`` /
+    ``clear_interventions`` / ``intervened_roles`` / ``_apply_interventions``)
+    from :class:`torchllms.models.networks.InterventionHost` — same API
+    surface as base ``Transformer`` so the Phase-5 hook machinery works
+    on both model families.
     """
 
     def __init__(self, params: ModelParams):
@@ -644,6 +651,11 @@ class GptOSSTransformer(nn.Module):
         self.output = nn.Linear(
             params.dim, params.vocab_size, bias=False, dtype=torch.bfloat16
         )
+        # Activation-intervention registry. Populated via
+        # ``register_intervention``; drained by ``clear_interventions``.
+        # The layer loop below calls ``_apply_interventions`` after each
+        # transformer block (InterventionHost contract).
+        self.interventions = nn.ModuleList()
 
     def init_cache(
         self,
@@ -692,9 +704,12 @@ class GptOSSTransformer(nn.Module):
                 wd_params.append(p)
         return wd_params, no_wd_params
 
-    def _build_forward_context(self, cache: PagedKVPool, S: int):
+    def _build_forward_context(self, cache: PagedKVPool, qlens):
         """Build the sink context for one forward. Shared by eager + the
         compile hoist path in ``LLM._model_forward``.
+
+        ``qlens`` is the per-row new-query-token list (see base
+        :meth:`Transformer._build_forward_context`).
 
         Returns ``(pre_write_seqlens, sink_ctx)`` matching the
         convention used by the base ``Transformer`` hoist. ``sink_ctx``
@@ -707,11 +722,15 @@ class GptOSSTransformer(nn.Module):
             build_sink_context_for_forward,
         )
         active_rids = cache.active_rollouts()
-        B = len(active_rids)
-        qlens = [S] * B
+        qlens_list = list(qlens)
+        if len(qlens_list) != len(active_rids):
+            raise ValueError(
+                f"_build_forward_context: qlens len={len(qlens_list)} "
+                f"!= active_rids len={len(active_rids)}"
+            )
         head_dim = self.params.head_dim
         return build_sink_context_for_forward(
-            pool=cache, active_rids=active_rids, qlens=qlens,
+            pool=cache, active_rids=active_rids, qlens=qlens_list,
             n_heads=self.params.n_heads, n_kv_heads=self.params.n_kv_heads,
             head_dim=head_dim,
             sliding_window=self.params.gpt_oss_sliding_window,
@@ -729,20 +748,15 @@ class GptOSSTransformer(nn.Module):
         cache: Optional[PagedKVPool] = None,
         logits_to_keep: Optional[int] = None,
         paged_ctx=None,  # FlashinferSinkContext; pre-built by LLM compile hoist
+        qlens=None,
     ):
         """Parallel in shape to :meth:`torchllms.models.networks.Transformer.forward`.
 
-        Builds the flashinfer sink context once per forward (both full
-        + sliding wrappers planned against the same
-        :class:`PagedBatchLayout`) and threads it through the layer
-        loop. Each attention layer picks its wrapper based on its own
-        ``sliding_window`` config.
-
-        The ``paged_ctx`` kwarg parallels base ``Transformer.forward``:
-        when provided by the LLM compile hoist, the sink context is
-        pre-built outside the compiled region (plan() has CPU-sync ops
-        that would fragment the graph). Eager callers without one get
-        the build done inline.
+        Supports both uniform ``[B, S]`` and flat-packed
+        ``[1, sum(qlens)]`` layouts; see the base Transformer docstring
+        for details. ``qlens`` is a per-row new-query-token list; when
+        provided, ``input_ids`` and ``role_ids`` are interpreted as
+        flat.
         """
         if cache is None:
             raise RuntimeError(
@@ -750,30 +764,76 @@ class GptOSSTransformer(nn.Module):
                 "flashinfer sink attention has no dense-KV variant."
             )
 
-        B, S = input_ids.shape
+        # Determine logical batch structure.
+        if qlens is None:
+            B, S = input_ids.shape
+            qlens_eff = [S] * B
+        else:
+            qlens_eff = list(qlens)
+            B = len(qlens_eff)
+            total = sum(qlens_eff)
+            if input_ids.shape != (1, total):
+                raise RuntimeError(
+                    f"flat-pack forward expects input_ids shape (1, {total}), "
+                    f"got {tuple(input_ids.shape)}"
+                )
 
         if paged_ctx is None:
             active_rids = cache.active_rollouts()
             if len(active_rids) != B:
                 raise RuntimeError(
                     f"cache has {len(active_rids)} live rollouts but forward "
-                    f"received input_ids with batch={B}"
+                    f"received batch={B}"
                 )
-            pre_write, paged_ctx = self._build_forward_context(cache, S)
+            pre_write, paged_ctx = self._build_forward_context(cache, qlens_eff)
             if input_pos is None:
-                input_pos = torch.arange(
-                    S, dtype=torch.int32, device=input_ids.device,
-                )[None, :] + pre_write[:, None]
+                if qlens is None:
+                    S = qlens_eff[0]
+                    input_pos = (
+                        torch.arange(
+                            S, dtype=torch.int32, device=input_ids.device,
+                        )[None, :]
+                        + pre_write[:, None]
+                    )
+                else:
+                    pos_parts = []
+                    pre_list = pre_write.tolist()
+                    for b in range(B):
+                        q = qlens_eff[b]
+                        pre = pre_list[b]
+                        pos_parts.append(
+                            torch.arange(
+                                pre, pre + q,
+                                dtype=torch.int32, device=input_ids.device,
+                            )
+                        )
+                    input_pos = torch.cat(pos_parts).unsqueeze(0)
 
         h = self.tok_embeddings(input_ids)
         if self.role_embeddings is not None and role_ids is not None:
             h += self.role_embeddings(role_ids)
 
-        for layer in self.layers:
+        for layer_id, layer in enumerate(self.layers):
             h = layer(h, role_ids, attn_mask, input_pos, cache, paged_ctx)
+            # Post-block intervention dispatch. No-op fast path when
+            # ``self.interventions`` is empty — zero overhead for runs
+            # without registered interventions.
+            h = self._apply_interventions(h, layer_id=layer_id, role_ids=role_ids)
 
         if logits_to_keep is not None:
-            h = h[:, -logits_to_keep:]
+            if qlens is None:
+                h = h[:, -logits_to_keep:]
+            else:
+                if logits_to_keep != 1:
+                    raise NotImplementedError(
+                        "logits_to_keep != 1 is not supported in flat-pack "
+                        "mode (qlens provided)"
+                    )
+                cumsum = (
+                    torch.tensor(qlens_eff, dtype=torch.int64, device=h.device)
+                    .cumsum(0) - 1
+                )
+                h = h[0].index_select(0, cumsum).unsqueeze(1)  # [B, 1, D]
 
         logits = self.output(self.norm(h))
         return logits.float(), cache

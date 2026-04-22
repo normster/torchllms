@@ -25,7 +25,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Set
+from typing import List, Optional, Sequence, Set
 
 try:
     from flash_attn import flash_attn_func, flash_attn_with_kvcache
@@ -661,39 +661,25 @@ class TransformerBlock(nn.Module):
         return out, scores
 
 
-class Transformer(nn.Module):
-    @classmethod
-    def from_params(cls, params: ModelParams):
-        if params.gpt_oss_arch:
-            from torchllms.models.networks_gptoss import GptOSSTransformer
-            return GptOSSTransformer(params)
-        elif params.olmo2_arch:
-            from torchllms.models.networks_olmo import OLMo2Transformer
-            return OLMo2Transformer(params)
-        else:
-            return cls(params)
+class InterventionHost:
+    """Mixin providing the activation-intervention API.
 
-    def __init__(self, params: ModelParams):
-        super().__init__()
-        self.params = params
-        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+    Host class contract:
 
-        if params.use_role_embeddings:
-            self.role_embeddings = RoleEmbeddings(params)
-        else:
-            self.role_embeddings = None
+    1. Inherit from ``nn.Module`` in addition to ``InterventionHost``
+       (MRO: ``class X(InterventionHost, nn.Module)``).
+    2. In ``__init__``, set ``self.interventions = nn.ModuleList()``.
+    3. Expose ``self.tok_embeddings`` — the embedding's ``weight.dtype``
+       and ``weight.device`` are used to place newly-registered modules.
+    4. Call ``self._apply_interventions(h, layer_id=i, role_ids=role_ids)``
+       after each transformer block in the forward pass.
 
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
-
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-
-        if params.tie_word_embeddings:
-            self.output = lambda x: nn.functional.linear(x, self.tok_embeddings.weight)
-        else:
-            self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
-        self.interventions = nn.ModuleList()
+    Shared by :class:`Transformer` and
+    :class:`torchllms.models.networks_gptoss.GptOSSTransformer` so the
+    intervention machinery (role-filter mask + layer dispatch + the
+    ``AddVec`` + ``Intervention`` wrappers + driver reinstall guidance)
+    lives in one place.
+    """
 
     def register_intervention(
         self,
@@ -704,24 +690,23 @@ class Transformer(nn.Module):
     ) -> None:
         """Install a delta-producing module as an activation intervention.
 
-        At each post-block site in ``layers``, the driver computes
-        ``hidden = hidden + mask * module(hidden)``. When ``role_ids`` is
-        a set of role IDs, ``mask`` is 1 at positions whose role is in
-        that set and 0 elsewhere. When ``role_ids is None``, the
-        intervention fires unconditionally.
+        At each post-block site in ``layers``, the host's forward loop
+        computes ``hidden = hidden + mask * module(hidden)``. When
+        ``role_ids`` is a set of role IDs, ``mask`` is 1 at positions
+        whose role is in that set and 0 elsewhere. When
+        ``role_ids is None``, the intervention fires unconditionally.
 
-        Multiple interventions compose: they are applied in registration
-        order.
+        Multiple interventions compose in registration order.
 
-        The module is moved to the Transformer's current device/dtype
-        (tracked via the token-embedding weight) and its parameters are
-        marked ``requires_grad=False`` — these are inference-time
-        interventions, not trainable params of the host model.
+        The module is moved to the host's current device/dtype (tracked
+        via ``self.tok_embeddings.weight``) and its parameters are marked
+        ``requires_grad=False`` — these are inference-time interventions,
+        not trainable params of the host model.
 
         Changing the installed set of interventions invalidates any
         ``torch.compile`` cache held by a driver (e.g.
-        ``LLM._compiled_decode_model``); reinstall compile after a
-        register/clear.
+        ``LLM._compiled_decode_model`` + ``_compiled_prefill_model``);
+        reinstall compile after register/clear.
         """
         target_dtype = self.tok_embeddings.weight.dtype
         target_device = self.tok_embeddings.weight.device
@@ -736,7 +721,7 @@ class Transformer(nn.Module):
         """Remove all registered interventions."""
         self.interventions = nn.ModuleList()
 
-    def list_interventions(self) -> List[Intervention]:
+    def list_interventions(self) -> List["Intervention"]:
         return list(self.interventions)
 
     def intervened_roles(self) -> Optional[Set[int]]:
@@ -789,9 +774,50 @@ class Transformer(nn.Module):
             hidden = hidden + mask * delta
         return hidden
 
-    def _build_forward_context(self, cache: PagedKVPool, S: int):
+
+class Transformer(InterventionHost, nn.Module):
+    @classmethod
+    def from_params(cls, params: ModelParams):
+        if params.gpt_oss_arch:
+            from torchllms.models.networks_gptoss import GptOSSTransformer
+            return GptOSSTransformer(params)
+        elif params.olmo2_arch:
+            from torchllms.models.networks_olmo import OLMo2Transformer
+            return OLMo2Transformer(params)
+        else:
+            return cls(params)
+
+    def __init__(self, params: ModelParams):
+        super().__init__()
+        self.params = params
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+
+        if params.use_role_embeddings:
+            self.role_embeddings = RoleEmbeddings(params)
+        else:
+            self.role_embeddings = None
+
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
+
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+
+        if params.tie_word_embeddings:
+            self.output = lambda x: nn.functional.linear(x, self.tok_embeddings.weight)
+        else:
+            self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.interventions = nn.ModuleList()
+
+    def _build_forward_context(self, cache: PagedKVPool, qlens: Sequence[int]):
         """Build the paged attention context for one forward. Shared by
         eager + the ``LLM._model_forward`` compile hoist.
+
+        ``qlens`` is the per-row new-query-token count (list, one entry
+        per active rollout). For uniform-length forwards (current
+        decode + traditional ``[B, S]`` prefill), callers pass
+        ``[S] * B``. For the flat-packed variable-length prefill path
+        (``forward(qlens=...)``), callers pass the true per-row qlens.
 
         Returns ``(pre_write_seqlens, paged_ctx)``. Subclasses override
         to return a different ``*Context`` type (e.g. gpt-oss's
@@ -802,11 +828,15 @@ class Transformer(nn.Module):
             build_paged_context_for_forward,
         )
         active_rids = cache.active_rollouts()
-        B = len(active_rids)
-        qlens = [S] * B
+        qlens_list = list(qlens)
+        if len(qlens_list) != len(active_rids):
+            raise ValueError(
+                f"_build_forward_context: qlens len={len(qlens_list)} "
+                f"!= active_rids len={len(active_rids)}"
+            )
         head_dim = self.params.head_dim
         return build_paged_context_for_forward(
-            pool=cache, active_rids=active_rids, qlens=qlens,
+            pool=cache, active_rids=active_rids, qlens=qlens_list,
             n_heads=self.params.n_heads, n_kv_heads=self.params.n_kv_heads,
             head_dim=head_dim,
             sm_scale=head_dim ** -0.5,
@@ -885,62 +915,104 @@ class Transformer(nn.Module):
         cache: Optional[PagedKVPool] = None,
         logits_to_keep: Optional[int] = None,
         paged_ctx: Optional["PagedContext"] = None,  # noqa: F821
+        qlens: Optional[Sequence[int]] = None,
     ):
         """
         Apply a single forward pass for training or inference (prefill + decoding).
 
+        Two supported input layouts:
+
+        1. **Uniform** (``qlens is None``) — ``input_ids`` is ``[B, S]``
+           with all rows sharing the same S. Canonical layout for
+           decode (S=1), single-prompt generation, and training /
+           scoring. This path is cudagraph-captureable and engages the
+           prefill/decode compile caches.
+
+        2. **Flat-packed** (``qlens`` provided) — ``input_ids`` is
+           ``[1, sum(qlens)]`` with the per-row segmentation given by
+           ``qlens``. Enables batched prefill over rows of heterogeneous
+           prompt lengths without padding or per-group temp-cache
+           round-trip. ``role_ids`` must match the flat layout if
+           supplied (shape ``[1, sum(qlens)]``). Logits-to-keep=1 in
+           this mode returns ``[B, 1, V]`` gathered at each row's
+           last-token position.
+
         Args:
-            input_ids: (bsz, seqlen).
-            role_ids: optional (bsz, seqlen) tensor. Threaded to
-                registered interventions for role-filter mask construction
-                without mutation.
-            attn_mask: optional (bsz, seqlen). Used only in the no-cache
-                path (training / scoring) by SDPA / eager attention. The
-                paged-cache path does causal + (optionally) sliding-window
-                attention via flashinfer and ignores ``attn_mask``.
-            input_pos: optional (bsz, seqlen) or (seqlen,) position IDs
-                for RoPE. When not provided and a cache is present, it is
-                computed from the pool's per-rollout pre-write seqlens.
-            cache: optional :class:`PagedKVPool`. When provided, the
-                pool's active rollouts must match ``input_ids.shape[0]``.
+            input_ids: ``[B, S]`` uniform, or ``[1, sum(qlens)]`` flat.
+            role_ids: same shape as ``input_ids``. Threaded to registered
+                interventions for role-filter mask construction without
+                mutation.
+            attn_mask: ``[B, S]``. Used only in the no-cache path
+                (training / scoring) by SDPA / eager attention. The
+                paged-cache path ignores it.
+            input_pos: position IDs for RoPE. When not provided and a
+                cache is present, computed from the pool's per-rollout
+                pre-write seqlens — uniform layout gets per-row
+                ``arange(S) + pre_write``; flat layout gets each row's
+                positions concatenated.
+            cache: optional :class:`PagedKVPool`. Number of active
+                rollouts must match B (uniform) or len(qlens) (flat).
             logits_to_keep: keep only the last N positions of logits
-                (generation uses 1; training / scoring leaves this unset).
+                (generation uses 1; training / scoring leaves unset).
+                In flat-pack mode only ``logits_to_keep=1`` is supported
+                (gathers each row's last-position logit).
+            qlens: per-row new-query-token counts; activates flat layout.
 
         Returns:
-            (logits, cache) — cache is returned by convention; the pool is
-            mutated in place, the return is a reference.
-
-        Paged-cache protocol:
-            The pool's ``row_positions`` are read before ``extend_many``
-            to derive RoPE ``input_pos``. ``extend_many`` allocates pages
-            for the ``S`` new tokens per row. A single flashinfer wrapper
-            (prefill when ``S > 1``, decode when ``S == 1``) is planned
-            against the resulting block tables and threaded through each
-            layer as ``paged_ctx``. Hooks receive the active (current-
-            forward) ``role_ids`` unchanged.
+            (logits, cache) — cache mutated in place.
         """
-
-        # paged_ctx is pre-built by the driver for the decode-compile
-        # path (``LLM._model_forward``) — plan() has CPU-sync ops that
-        # fragment cudagraph partitions, so it must run OUTSIDE the
-        # compiled region. Eager callers without a pre-built ctx get
-        # the build done inline here via ``_build_forward_context``
-        # (overridden per-model: base Transformer builds a paged_ctx,
-        # GptOSSTransformer builds a sink_ctx — the driver treats both
-        # uniformly). input_pos must be supplied in both cases.
-        if cache is not None and paged_ctx is None:
+        # Determine logical batch structure.
+        if qlens is None:
             B, S = input_ids.shape
+            qlens_eff = [S] * B
+        else:
+            qlens_eff = list(qlens)
+            B = len(qlens_eff)
+            total = sum(qlens_eff)
+            if input_ids.shape != (1, total):
+                raise RuntimeError(
+                    f"flat-pack forward expects input_ids shape (1, {total}), "
+                    f"got {tuple(input_ids.shape)}"
+                )
+
+        # paged_ctx is pre-built by the driver for the compile-hoist
+        # paths (``LLM._model_forward``) — plan() has CPU-sync ops that
+        # fragment cudagraph partitions, so it must run OUTSIDE the
+        # compiled region. Eager callers (including all flat-pack
+        # callers) get the build done inline here via
+        # ``_build_forward_context``.
+        if cache is not None and paged_ctx is None:
             active_rids = cache.active_rollouts()
             if len(active_rids) != B:
                 raise RuntimeError(
                     f"cache has {len(active_rids)} live rollouts but forward "
-                    f"received input_ids with batch={B}"
+                    f"received batch={B}"
                 )
-            pre_write, paged_ctx = self._build_forward_context(cache, S)
+            pre_write, paged_ctx = self._build_forward_context(cache, qlens_eff)
             if input_pos is None:
-                input_pos = torch.arange(
-                    S, dtype=torch.int32, device=input_ids.device,
-                )[None, :] + pre_write[:, None]
+                if qlens is None:
+                    # Uniform: arange broadcasts over rows.
+                    S = qlens_eff[0]
+                    input_pos = (
+                        torch.arange(
+                            S, dtype=torch.int32, device=input_ids.device,
+                        )[None, :]
+                        + pre_write[:, None]
+                    )
+                else:
+                    # Flat-packed: concatenate per-row positions.
+                    pos_parts = []
+                    pre_list = pre_write.tolist()
+                    for b in range(B):
+                        q = qlens_eff[b]
+                        pre = pre_list[b]
+                        pos_parts.append(
+                            torch.arange(
+                                pre, pre + q,
+                                dtype=torch.int32, device=input_ids.device,
+                            )
+                        )
+                    input_pos = torch.cat(pos_parts).unsqueeze(0)
 
         h = self.tok_embeddings(input_ids)
 
@@ -956,7 +1028,21 @@ class Transformer(nn.Module):
             )
 
         if logits_to_keep is not None:
-            h = h[:, -logits_to_keep:]
+            if qlens is None:
+                h = h[:, -logits_to_keep:]
+            else:
+                if logits_to_keep != 1:
+                    raise NotImplementedError(
+                        "logits_to_keep != 1 is not supported in flat-pack "
+                        "mode (qlens provided)"
+                    )
+                # Per-row last-position gather. cumsum(qlens) - 1 gives
+                # the flat index of each row's final token.
+                cumsum = (
+                    torch.tensor(qlens_eff, dtype=torch.int64, device=h.device)
+                    .cumsum(0) - 1
+                )
+                h = h[0].index_select(0, cumsum).unsqueeze(1)  # [B, 1, D]
 
         logits = self.output(self.norm(h))
 

@@ -86,48 +86,115 @@ class FakeTransformer(torch.nn.Module):
         logits_to_keep=None,
         attn_mask=None,
         input_pos=None,
+        qlens=None,
     ):
         # The FakeTransformer doesn't actually do attention; it writes
         # deterministic K/V and produces deterministic logits.
-        B, S = input_ids.shape
-        self.forward_calls.append({"input_ids": input_ids.clone(), "seqlen": S})
+        #
+        # Two input layouts, mirroring the real Transformer:
+        #   * uniform  (qlens=None): input_ids [B, S]
+        #   * flat-pack (qlens=[s0,s1,...,s_{B-1}]): input_ids [1, sum(qlens)]
+        # For flat-pack + KVArena cache we unpack row-by-row and pad to max S,
+        # then write rectangular [B, max_S, ...] — since the per-row writes
+        # zero-fill trailing positions, arena reads later slice by each row's
+        # true seqlen anyway.
+        if qlens is None:
+            B, S = input_ids.shape
+            qlens_list = [S] * B
+            ids_per_row = [input_ids[b] for b in range(B)]
+        else:
+            qlens_list = list(qlens)
+            B = len(qlens_list)
+            total = sum(qlens_list)
+            assert input_ids.shape == (1, total), (
+                f"flat-pack expects [1, {total}], got {tuple(input_ids.shape)}"
+            )
+            flat = input_ids[0]
+            ids_per_row = []
+            off = 0
+            for q in qlens_list:
+                ids_per_row.append(flat[off : off + q])
+                off += q
+            S = max(qlens_list) if qlens_list else 0
+
+        # ``seqlen`` preserved for tests written before qlens existed
+        # (applies only to the uniform layout — flat-pack callers check
+        # the qlens field instead).
+        self.forward_calls.append({
+            "input_ids": input_ids.clone(),
+            "seqlen": qlens_list[0] if qlens is None and qlens_list else None,
+            "qlens": list(qlens_list),
+        })
 
         assert cache is not None, "FakeTransformer expects cache in tests"
         assert cache.b_live == B, (
-            f"FakeTransformer: cache.b_live={cache.b_live} != input_ids.shape[0]={B}"
+            f"FakeTransformer: cache.b_live={cache.b_live} != B={B}"
         )
 
         cache.update_role_ids(role_ids)
         cache.update_attn_mask(attn_mask)
 
         # Pre-update row_positions = per-row starting absolute position.
-        # Supports both uniform and diverging batched forward.
         row_starts = cache.row_positions.clone()  # [B] on device
         device = input_ids.device
 
-        # K[p] = absolute position p, V[p] = -p per row. Build a [B, S] matrix
-        # of absolute positions, one row per input sequence. Under diverging
-        # row_starts, each row's K values reflect its own position axis.
+        # Build [B, S] padded absolute-position matrix. For rows shorter
+        # than S, the extra positions get a filler that matches the arena
+        # write layout — fine since the arena slices by each row's true
+        # seqlen on read.
         arange_s = torch.arange(S, dtype=torch.bfloat16, device=device)
-        abs_pos_bs = arange_s[None, :] + row_starts[:, None].to(torch.bfloat16)  # [B, S]
-        k_single = abs_pos_bs[:, :, None, None].expand(B, S, N_KV_HEADS, HEAD_DIM).contiguous()
+        abs_pos_bs = (
+            arange_s[None, :] + row_starts[:, None].to(torch.bfloat16)
+        )  # [B, S]
+        k_single = abs_pos_bs[:, :, None, None].expand(
+            B, S, N_KV_HEADS, HEAD_DIM
+        ).contiguous()
         v_single = -k_single
 
         for layer_id in range(self.params.n_layers):
             cache.update_kv(layer_id, k_single, v_single)
 
-        # Logits: for each row, each output position's argmax = (abs_pos + 1) % VOCAB,
-        # where abs_pos depends on that row's own pos_start.
-        out_len = logits_to_keep if logits_to_keep is not None else S
-        logits = torch.full(
-            (B, out_len, VOCAB), fill_value=-10.0, dtype=torch.bfloat16, device=device
-        )
-        for b in range(B):
-            end_pos_b = int(row_starts[b].item()) + S
-            for i in range(out_len):
-                abs_pos = end_pos_b - out_len + i
-                tok = (abs_pos + 1) % VOCAB
-                logits[b, i, tok] = 10.0
+        # Flat-pack with variable row lengths: ``update_kv`` advances
+        # ``seen_tokens`` by the rectangular S = max(qlens) for every row,
+        # but a row shorter than S should only advance by its own qlen.
+        # Reset per-row seen_tokens to the correct post-write values so
+        # the arena's later slicing (``fa_with_kvcache`` / chunk extract)
+        # sees each row's real valid range. Uniform mode doesn't need this
+        # — S is the same as every row's qlen.
+        if qlens is not None and len(set(qlens_list)) > 1:
+            true_lengths = (
+                row_starts.to(torch.int32)
+                + torch.tensor(qlens_list, dtype=torch.int32, device=device)
+            )
+            cache.set_seen_tokens_per_row(true_lengths)
+
+        # Logits per row. In uniform mode: [B, out_len, V]. In flat-pack
+        # with logits_to_keep=1, return [B, 1, V] with argmax at each
+        # row's true last position. logits_to_keep != 1 in flat-pack is
+        # unsupported (matches real Transformer).
+        if qlens is None:
+            out_len = logits_to_keep if logits_to_keep is not None else S
+            logits = torch.full(
+                (B, out_len, VOCAB), fill_value=-10.0, dtype=torch.bfloat16, device=device,
+            )
+            for b in range(B):
+                end_pos_b = int(row_starts[b].item()) + S
+                for i in range(out_len):
+                    abs_pos = end_pos_b - out_len + i
+                    tok = (abs_pos + 1) % VOCAB
+                    logits[b, i, tok] = 10.0
+        else:
+            if logits_to_keep != 1:
+                raise NotImplementedError(
+                    "FakeTransformer flat-pack mode only supports logits_to_keep=1"
+                )
+            logits = torch.full(
+                (B, 1, VOCAB), fill_value=-10.0, dtype=torch.bfloat16, device=device,
+            )
+            for b in range(B):
+                end_pos_b = int(row_starts[b].item()) + qlens_list[b]
+                tok = end_pos_b % VOCAB  # argmax at last position = (last_abs_pos + 1) % V
+                logits[b, 0, tok] = 10.0
 
         return logits, cache
 
@@ -145,6 +212,7 @@ def _build_llm(
     llm = LLM.__new__(LLM)
     llm.model = model
     llm._compiled_decode_model = None
+    llm._compiled_prefill_model = None
     llm.tokenizer = _FakeTokenizer()
     llm.template_config = None
     llm.max_len = max_len

@@ -327,15 +327,25 @@ class LLM:
         # prefill case.
         input_ids = kwargs.get("input_ids")
         cache = kwargs.get("cache")
+        qlens = kwargs.get("qlens")
 
+        # Compile paths engage for uniform ``[B, S]`` input only. The
+        # flat-packed variable-length path (``qlens`` provided) goes
+        # through eager — flashinfer's cudagraph-prefill contract pins
+        # batch size + max-total-tokens, which is incompatible with
+        # variable-length batching. See
+        # docs/note_prefill_compile_plan.md § P1.2 for the bucketed-
+        # cudagraph-prefill follow-up that would unlock this.
         use_compiled_decode = (
-            self._compiled_decode_model is not None
+            qlens is None
+            and self._compiled_decode_model is not None
             and input_ids is not None
             and input_ids.shape[1] == 1
             and cache is not None
         )
         use_compiled_prefill = (
-            self._compiled_prefill_model is not None
+            qlens is None
+            and self._compiled_prefill_model is not None
             and input_ids is not None
             and input_ids.shape[1] > 1
             and cache is not None
@@ -346,7 +356,7 @@ class LLM:
             if isinstance(cache, PagedKVPool):
                 B, S = input_ids.shape
                 pre_write, paged_ctx = self.model._build_forward_context(
-                    cache, S,
+                    cache, [S] * B,
                 )
                 if kwargs.get("input_pos") is None:
                     kwargs["input_pos"] = (
@@ -996,117 +1006,70 @@ class LLM:
         prefix_page_ids: List[Optional[tuple]],
         temperature: float,
     ) -> List[int]:
-        """Group rows by ``(prefill_start, prompt_len)``. One batched
-        prefill per group.
+        """Batched prefill with per-row variable prompt lengths.
 
-        Single-group fast path: every row in the batch shares the same
-        (prefill_start, prompt_len). Rows with a radix hit borrow the
-        matched pages into their main-cache rid (``borrow_pages`` +
-        ``attach_borrowed_pages``). All rows then run a single batched
-        prefill on the suffix.
+        Flat-packs all post-prefix-borrow suffixes into a single
+        ``[1, total_new_tokens]`` tensor and runs one forward with the
+        paged_ctx carrying per-row ``qo_indptr`` (via ``qlens``). One
+        kernel launch per layer regardless of per-row length variation.
 
-        Multi-group path: heterogeneous prefix_start or prompt_len within
-        the batch. The prefix cache is skipped for simplicity (each
-        row's prefill_start is forced to 0) and each group prefills
-        through a tmp cache + KVChunk round-trip into the main cache.
-        Multi-group is the uncommon case; the Phase 4 plan is to fold
-        it into a page-table copy so the KVChunk round-trip disappears
-        from the multi-group path too.
+        Replaces the earlier group-by-shape implementation. The old
+        design had two code paths: a uniform-shape fast path, and a
+        multi-group fallback that did a tmp cache + KVChunk D2H/H2D
+        round-trip per unique shape. Flat-pack is strictly better —
+        same kernel efficiency as the fast path and no D2H/H2D cost for
+        variable-length batches.
+
+        Prefix cache hits: each row borrows pre-committed pages from
+        the radix and attaches them to the main-cache rid before
+        prefill, so the suffix being prefilled is only the post-prefix
+        content.
 
         Returns first-tokens in row order.
         """
         B = len(rids)
-        first_tokens: List[int] = [0] * B
 
-        # Group by (prefill_start, prompt_len).
-        groups: Dict[tuple, List[int]] = {}
+        # Per-row prefix borrow (only PagedKVPool exposes borrow/attach).
+        borrow_fn = getattr(cache, "borrow_pages", None)
+        attach_fn = getattr(cache, "attach_borrowed_pages", None)
+        if borrow_fn is not None and attach_fn is not None:
+            for i, rid in enumerate(rids):
+                pids = prefix_page_ids[i]
+                if pids:
+                    borrow_fn(pids)
+                    attach_fn(rid, pids)
+
+        # Flat-pack suffixes + per-row qlens.
+        flat_ids: List[int] = []
+        flat_roles: Optional[List[int]] = [] if role_id_lists is not None else None
+        qlens: List[int] = []
         for i in range(B):
-            key = (prefill_starts[i], len(prompt_token_lists[i]))
-            groups.setdefault(key, []).append(i)
+            pstart = prefill_starts[i]
+            suf = prompt_token_lists[i][pstart:]
+            qlens.append(len(suf))
+            flat_ids.extend(suf)
+            if flat_roles is not None:
+                flat_roles.extend(role_id_lists[i][pstart:])
 
-        if len(groups) == 1:
-            # Fast path: one group matching the main cache.
-            prefill_start, _prompt_len = next(iter(groups))
-            # Per-row prefix borrow (only needed for PagedKVPool; KVArena
-            # doesn't have borrow_pages and can't share pages across rows).
-            borrow_fn = getattr(cache, "borrow_pages", None)
-            attach_fn = getattr(cache, "attach_borrowed_pages", None)
-            if borrow_fn is not None and attach_fn is not None:
-                for i, rid in enumerate(rids):
-                    pids = prefix_page_ids[i]
-                    if pids:
-                        borrow_fn(pids)
-                        attach_fn(rid, pids)
-            suffix_ids_list = [
-                prompt_token_lists[i][prefill_start:] for i in range(B)
-            ]
-            suffix_t = torch.tensor(
-                suffix_ids_list, dtype=torch.long, device=self.device,
-            )
-            roles_t = None
-            if role_id_lists is not None:
-                suffix_roles = [
-                    role_id_lists[i][prefill_start:] for i in range(B)
-                ]
-                roles_t = torch.tensor(
-                    suffix_roles, dtype=torch.long, device=self.device,
-                )
-            logits, _ = self._model_forward(
-                input_ids=suffix_t,
-                role_ids=roles_t,
-                cache=cache,
-                logits_to_keep=1,
-            )
-            sampled, _ = inference.utils.sample(logits, temperature=temperature)
-            for i, tok in enumerate(sampled.view(-1).tolist()):
-                first_tokens[i] = int(tok)
-            return first_tokens
+        input_ids_t = torch.tensor(
+            [flat_ids], dtype=torch.long, device=self.device,
+        )
+        role_ids_t = (
+            torch.tensor([flat_roles], dtype=torch.long, device=self.device)
+            if flat_roles is not None else None
+        )
 
-        # Multi-group: drop the prefix cache, prefill each group via a
-        # tmp cache + KVChunk round-trip into the main cache. See the
-        # docstring for why we accept the D2H/H2D cost here.
-        regroups: Dict[int, List[int]] = {}
-        for i in range(B):
-            regroups.setdefault(len(prompt_token_lists[i]), []).append(i)
-
-        for prompt_len, indices in regroups.items():
-            group_B = len(indices)
-            tmp = self.model.init_cache(
-                group_B, self.device, max_cache_len=prompt_len + 1,
-            )
-            tmp_rids = [tmp.claim() for _ in indices]
-
-            suffix_ids_list = [
-                prompt_token_lists[orig_i] for orig_i in indices
-            ]
-            suffix_t = torch.tensor(
-                suffix_ids_list, dtype=torch.long, device=self.device,
-            )
-            roles_t = None
-            if role_id_lists is not None:
-                suffix_roles = [
-                    role_id_lists[orig_i] for orig_i in indices
-                ]
-                roles_t = torch.tensor(
-                    suffix_roles, dtype=torch.long, device=self.device,
-                )
-            logits, _ = self._model_forward(
-                input_ids=suffix_t,
-                role_ids=roles_t,
-                cache=tmp,
-                logits_to_keep=1,
-            )
-            sampled, _ = inference.utils.sample(logits, temperature=temperature)
-            group_first = sampled.view(-1).tolist()
-
-            for idx_in_group, orig_i in enumerate(indices):
-                first_tokens[orig_i] = int(group_first[idx_in_group])
-                chunk = tmp.extract_chunk(
-                    tmp_rids[idx_in_group], length=prompt_len,
-                )
-                cache.load_chunk(chunk, rids[orig_i])
-
-        return first_tokens
+        logits, _ = self._model_forward(
+            input_ids=input_ids_t,
+            role_ids=role_ids_t,
+            cache=cache,
+            logits_to_keep=1,
+            qlens=qlens,
+        )
+        # logits: [B, 1, V] — per-row last-token logit, gathered inside
+        # the model's forward via ``cumsum(qlens) - 1``.
+        sampled, _ = inference.utils.sample(logits, temperature=temperature)
+        return [int(t) for t in sampled.view(-1).tolist()]
 
     def generate_batched(
         self,
