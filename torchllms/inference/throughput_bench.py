@@ -257,170 +257,6 @@ def _split_prefill_decode(
 
 
 # ---------------------------------------------------------------------------
-# Noop-hook wrapper for optional activation-hook overhead measurement
-# ---------------------------------------------------------------------------
-
-
-def _make_counting_noop_hook():
-    calls = 0
-
-    def noop_intervention(hidden, ctx):
-        nonlocal calls
-        calls += 1
-        return hidden
-
-    def get_calls() -> int:
-        return calls
-
-    return noop_intervention, get_calls
-
-
-def _split_torchllms_with_optional_noop(
-    llm,
-    ids: list[int],
-    roles: Optional[list[int]],
-    max_new: int,
-    tokenizer,
-    *,
-    use_noop_hook: bool,
-    trials: int,
-    warmup: int,
-):
-    noop_hook, get_calls = _make_counting_noop_hook()
-    llm.prefix_cache = None
-    if hasattr(llm, "clear_activation_hooks"):
-        llm.clear_activation_hooks()
-    if use_noop_hook and hasattr(llm, "set_activation_hooks"):
-        llm.set_activation_hooks(noop_hook)
-    try:
-        out, pre, dec = _split_prefill_decode(
-            lambda n: _gen_torchllms_once(llm, ids, roles, n, tokenizer),
-            max_new, trials=trials, warmup=warmup,
-        )
-    finally:
-        if hasattr(llm, "clear_activation_hooks"):
-            llm.clear_activation_hooks()
-    return out, pre, dec, get_calls()
-
-
-def _gen_torchllms_once_with_optional_noop(
-    llm,
-    ids: list[int],
-    roles: Optional[list[int]],
-    max_new: int,
-    tokenizer,
-    *,
-    prefix_cache,
-    use_noop_hook: bool,
-):
-    noop_hook, get_calls = _make_counting_noop_hook()
-    llm.prefix_cache = prefix_cache
-    if hasattr(llm, "clear_activation_hooks"):
-        llm.clear_activation_hooks()
-    if use_noop_hook and hasattr(llm, "set_activation_hooks"):
-        llm.set_activation_hooks(noop_hook)
-    try:
-        out, wall = _gen_torchllms_once(llm, ids, roles, max_new, tokenizer)
-    finally:
-        if hasattr(llm, "clear_activation_hooks"):
-            llm.clear_activation_hooks()
-    return out, wall, get_calls()
-
-
-# ---------------------------------------------------------------------------
-# Single-workload bench
-# ---------------------------------------------------------------------------
-
-
-def _bench_single(
-    llm,
-    engine,
-    conv: list[dict],
-    max_new: int,
-    tokenize_fn: TokenizeFn,
-    tokenizer,
-    label: str,
-    *,
-    stop_token_ids: Optional[list[int]] = None,
-    run_noop_hook: bool = True,
-    trials: int = 3,
-    warmup: int = 1,
-) -> None:
-    ids, roles = tokenize_fn(conv, True)
-
-    t_out, t_pre, t_dec, _ = _split_torchllms_with_optional_noop(
-        llm, ids, roles, max_new, tokenizer,
-        use_noop_hook=False, trials=trials, warmup=warmup,
-    )
-    if run_noop_hook:
-        tn_out, tn_pre, tn_dec, noop_calls = _split_torchllms_with_optional_noop(
-            llm, ids, roles, max_new, tokenizer,
-            use_noop_hook=True, trials=trials, warmup=warmup,
-        )
-    else:
-        tn_out, tn_pre, tn_dec, noop_calls = None, 0.0, 0.0, 0
-    if engine is not None:
-        s_out, s_pre, s_dec = _split_prefill_decode(
-            lambda n: _gen_sglang_once(engine, ids, n, tokenizer, stop_token_ids),
-            max_new, trials=trials, warmup=warmup,
-        )
-    else:
-        s_out, s_pre, s_dec = None, 0.0, 0.0
-
-    def tps_pair(prompt_len, out_tokens, pre_s, dec_s):
-        pre_tps = prompt_len / pre_s if pre_s > 0 else 0.0
-        dec_tokens = max(out_tokens - 1, 0)  # first token comes from prefill
-        dec_tps = dec_tokens / dec_s if dec_s > 0 else 0.0
-        return pre_tps, dec_tps, dec_tokens
-
-    t_pre_tps, t_dec_tps, _ = tps_pair(len(ids), len(t_out.token_ids), t_pre, t_dec)
-
-    print(
-        f"\n  [{label}] prompt={len(ids)}t  torchllms_out={len(t_out.token_ids)}t"
-        + (f"  noop_out={len(tn_out.token_ids)}t" if tn_out is not None else "")
-        + (f"  sglang_out={len(s_out.token_ids)}t" if s_out is not None else "")
-    )
-    print(
-        f"    {'engine':<10s}  {'prefill_tps':>11s}  "
-        f"{'decode_tps':>11s}  {'total_s':>8s}"
-    )
-    print(
-        f"    {'torchllms':<10s}  {t_pre_tps:>11.1f}  {t_dec_tps:>11.1f}  "
-        f"{t_pre + t_dec:>8.2f}"
-    )
-    if tn_out is not None:
-        tn_pre_tps, tn_dec_tps, _ = tps_pair(
-            len(ids), len(tn_out.token_ids), tn_pre, tn_dec,
-        )
-        print(
-            f"    {'torch+noop':<10s}  {tn_pre_tps:>11.1f}  "
-            f"{tn_dec_tps:>11.1f}  {tn_pre + tn_dec:>8.2f}"
-        )
-    if s_out is not None:
-        s_pre_tps, s_dec_tps, _ = tps_pair(
-            len(ids), len(s_out.token_ids), s_pre, s_dec,
-        )
-        print(
-            f"    {'sglang':<10s}  {s_pre_tps:>11.1f}  "
-            f"{s_dec_tps:>11.1f}  {s_pre + s_dec:>8.2f}"
-        )
-        if t_pre_tps > 0 and t_dec_tps > 0:
-            print(
-                f"    sglang/torchllms speedup: prefill={s_pre_tps/t_pre_tps:.2f}x  "
-                f"decode={s_dec_tps/t_dec_tps:.2f}x"
-            )
-    if tn_out is not None and t_pre > 0 and t_dec > 0:
-        noop_pre_slowdown = tn_pre / t_pre
-        noop_dec_slowdown = tn_dec / t_dec
-        noop_total_slowdown = (tn_pre + tn_dec) / (t_pre + t_dec)
-        print(
-            f"    noop/torchllms time: prefill={noop_pre_slowdown:.2f}x  "
-            f"decode={noop_dec_slowdown:.2f}x  total={noop_total_slowdown:.2f}x  "
-            f"hook_calls={noop_calls}"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
@@ -531,195 +367,291 @@ def bench_engine(
     return results
 
 
-def print_combined_throughput(
-    torchllms_res: EngineResults,
-    sglang_res: Optional[EngineResults],
+def print_matrix_table(
+    results: list[tuple[str, EngineResults]],
     *,
     model_label: str,
 ) -> None:
-    """Format torchllms and (optional) SGLang EngineResults as a single
-    side-by-side table with speedup ratios."""
-    print("\n" + "=" * 72)
-    print(f"THROUGHPUT — {model_label}")
-    print("=" * 72)
+    """Format the matrix of EngineResults as a single table.
 
-    for w_name, t_w, s_w in [
-        ("W1 short/short", torchllms_res.w1, sglang_res.w1 if sglang_res else None),
-        ("W2 short/long",  torchllms_res.w2, sglang_res.w2 if sglang_res else None),
-    ]:
-        if t_w is None:
-            continue
-        print(f"\n  {w_name}  prompt={t_w.prompt_len}t  torchllms_out={t_w.out_tokens}t"
-              + (f"  sglang_out={s_w.out_tokens}t" if s_w else ""))
-        print(f"    {'engine':<10s}  {'prefill_tps':>11s}  {'decode_tps':>11s}  {'total_s':>8s}")
-        print(f"    {'torchllms':<10s}  {t_w.prefill_tps:>11.1f}  {t_w.decode_tps:>11.1f}  "
-              f"{t_w.prefill_s + t_w.decode_s:>8.2f}")
-        if s_w is not None:
-            print(f"    {'sglang':<10s}  {s_w.prefill_tps:>11.1f}  {s_w.decode_tps:>11.1f}  "
-                  f"{s_w.prefill_s + s_w.decode_s:>8.2f}")
-            if t_w.prefill_tps > 0 and t_w.decode_tps > 0:
-                print(f"    sglang/torchllms speedup: "
-                      f"prefill={s_w.prefill_tps/t_w.prefill_tps:.2f}x  "
-                      f"decode={s_w.decode_tps/t_w.decode_tps:.2f}x")
-
-    # W3 side-by-side turns
-    print("\n  W3 multiturn (agentic, cache engaged)")
-    for i in range(max(len(torchllms_res.w3_turns), len(sglang_res.w3_turns) if sglang_res else 0)):
-        t_prompt, t_wall, t_out = torchllms_res.w3_turns[i]
-        line = f"    turn {i}: prompt={t_prompt}t  torchllms={t_wall*1000:.0f}ms ({t_out}t)"
-        if sglang_res and i < len(sglang_res.w3_turns):
-            s_prompt, s_wall, s_out = sglang_res.w3_turns[i]
-            line += f"  sglang={s_wall*1000:.0f}ms ({s_out}t)"
-        print(line)
-    if sglang_res:
-        t_total = torchllms_res.w3_total_s
-        s_total = sglang_res.w3_total_s
-        print(f"\n    multiturn total: torchllms={t_total:.2f}s  sglang={s_total:.2f}s"
-              + (f"  sglang/torchllms={t_total/s_total:.2f}x" if s_total > 0 else ""))
-
-
-def run_throughput(
-    llm,
-    engine,
-    tokenize_fn: TokenizeFn,
-    tokenizer,
-    *,
-    prefix_cache=None,
-    model_label: str = "torchllms",
-    stop_token_ids: Optional[list[int]] = None,
-    run_noop_hook: bool = True,
-    w3_max_new: int = W3_MAX_NEW_DEFAULT,
-    w3_system_content: str = SYSTEM_DEBUG,
-    trials: int = 3,
-    warmup: int = 1,
-    compile_decode: bool = False,
-) -> None:
-    # Optional: enable decode-compile before benching. First call post-compile
-    # triggers the Inductor warmup (cudagraph capture under reduce-overhead),
-    # which is charged against "engine setup" rather than per-workload wall.
-    compile_warmup_s = 0.0
-    if compile_decode:
-        if not hasattr(llm, "enable_decode_compile"):
-            print("  [warn] --compile-decode requested but llm has no "
-                  "enable_decode_compile; running eager")
-        else:
-            print("  Enabling decode-compile + warming up (one decode call) ...")
-            llm.enable_decode_compile()
-            # Warm up via a trivial short-prompt single-step decode through
-            # the W1 conversation so the first timed call doesn't pay
-            # compile cost. Measure that warmup separately.
-            w1_ids, w1_roles = tokenize_fn(W1_CONV, True)
-            llm.prefix_cache = None
-            t0 = time.perf_counter()
-            _gen_torchllms_once(llm, w1_ids, w1_roles, 4, tokenizer)
-            compile_warmup_s = time.perf_counter() - t0
-            print(f"    decode-compile warmup: {compile_warmup_s:.2f}s")
-    """Run W1/W2/W3 and print a unified table.
-
-    ``prefix_cache``: a ``RadixKVCache`` that carries across W3's
-    multi-turn dialogue. For W1/W2 the cache is zeroed by
-    ``_split_torchllms_with_optional_noop``. If None, W3 still runs but
-    without prefix-cache benefit (degenerate but measurable).
-
-    ``stop_token_ids``: passed to SGLang sampling_params (torchllms's own
-    stop handling comes from llm.eos_ids, set at llm construction).
-
-    ``run_noop_hook``: if False, skip the torch+noop column (useful for
-    gpt-oss which may not expose activation_hooks).
+    ``results`` is a list of ``(cell_label, EngineResults)`` tuples —
+    typically ``[torch-eager, torch-compile, sglang-graph-on,
+    sglang-graph-off]`` but any subset works.
     """
-    print("\n" + "=" * 72)
-    print(f"THROUGHPUT — {model_label}"
-          + ("  [decode-compile ON]" if compile_decode else "  [eager]"))
-    print("=" * 72)
-    print(
-        f"  Median of {trials} trials, {warmup} warm-up. Prefill measured via "
-        f"max_new=1, decode inferred from full_call - prefill_call."
+    print("\n" + "=" * 84)
+    print(f"THROUGHPUT MATRIX — {model_label}")
+    print("=" * 84)
+    hdr = (
+        f"  {'cell':<24} "
+        f"{'W1 prefill tps':>15} {'W1 decode tps':>14} "
+        f"{'W2 prefill tps':>15} {'W2 decode tps':>14} "
+        f"{'W3 total s':>11}"
     )
-    if compile_warmup_s > 0:
-        print(f"  decode-compile warmup: {compile_warmup_s:.2f}s (one-time, "
-              f"not counted in per-workload timings)")
-
-    print("\n  -- W1: short prompt + short completion --")
-    _bench_single(
-        llm, engine, W1_CONV, W1_MAX_NEW, tokenize_fn, tokenizer, "short/short",
-        stop_token_ids=stop_token_ids, run_noop_hook=run_noop_hook,
-        trials=trials, warmup=warmup,
-    )
-
-    print("\n  -- W2: short prompt + long completion --")
-    _bench_single(
-        llm, engine, W2_CONV, W2_MAX_NEW, tokenize_fn, tokenizer, "short/long",
-        stop_token_ids=stop_token_ids, run_noop_hook=run_noop_hook,
-        trials=trials, warmup=warmup,
-    )
-
-    print("\n  -- W3: multiturn long/short (agentic, cache engaged) --")
-    # W3 uses the prefix cache across turns — so fresh cache per run, but
-    # not between turns.
-    if prefix_cache is not None:
-        prefix_cache.clear()
-    # Noop-hook W3 uses its own prefix cache so the two runs don't share
-    # state; only test if noop hook requested.
-    if run_noop_hook and prefix_cache is not None:
-        from torchllms.inference.prefix_cache import RadixKVCache
-        noop_prefix_cache = RadixKVCache(max_bytes=4 * 1024**3)
-    else:
-        noop_prefix_cache = None
-
-    torchllms_turn_times: list[tuple[float, int]] = []
-    noop_turn_times: list[tuple[float, int]] = []
-    sglang_turn_times: list[tuple[float, int]] = []
-    noop_hook_calls = 0
-    for turn_idx in range(len(W3_TURNS)):
-        conv = build_w3_history_to_turn(turn_idx + 1, w3_system_content)
-        ids, roles = tokenize_fn(conv, True)
-
-        t_out, t_wall, _ = _gen_torchllms_once_with_optional_noop(
-            llm, ids, roles, w3_max_new, tokenizer,
-            prefix_cache=prefix_cache, use_noop_hook=False,
-        )
-        if run_noop_hook:
-            tn_out, tn_wall, tn_calls = _gen_torchllms_once_with_optional_noop(
-                llm, ids, roles, w3_max_new, tokenizer,
-                prefix_cache=noop_prefix_cache, use_noop_hook=True,
-            )
-        else:
-            tn_out, tn_wall, tn_calls = None, 0.0, 0
-        if engine is not None:
-            s_out, s_wall = _gen_sglang_once(
-                engine, ids, w3_max_new, tokenizer, stop_token_ids,
-            )
-        else:
-            s_out, s_wall = None, 0.0
-
-        torchllms_turn_times.append((t_wall, len(t_out.token_ids)))
-        if tn_out is not None:
-            noop_turn_times.append((tn_wall, len(tn_out.token_ids)))
-            noop_hook_calls += tn_calls
-        if s_out is not None:
-            sglang_turn_times.append((s_wall, len(s_out.token_ids)))
-
-        parts = [
-            f"turn {turn_idx}:",
-            f"prompt={len(ids)}t",
-            f"torchllms={t_wall*1000:.0f}ms ({len(t_out.token_ids)}t)",
-        ]
-        if tn_out is not None:
-            parts.append(f"noop={tn_wall*1000:.0f}ms ({len(tn_out.token_ids)}t)")
-        if s_out is not None:
-            parts.append(f"sglang={s_wall*1000:.0f}ms ({len(s_out.token_ids)}t)")
-        print("    " + "  ".join(parts))
-
-    t_total = sum(w for w, _ in torchllms_turn_times)
-    tn_total = sum(w for w, _ in noop_turn_times) if noop_turn_times else 0.0
-    s_total = sum(w for w, _ in sglang_turn_times) if sglang_turn_times else 0.0
-
-    line = f"\n    multiturn total: torchllms={t_total:.2f}s"
-    if s_total > 0:
-        line += f"  sglang={s_total:.2f}s  sglang/torchllms={t_total/s_total:.2f}x"
-    print(line)
-    if tn_total > 0 and t_total > 0:
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for label, r in results:
+        w1p = r.w1.prefill_tps if r.w1 else 0.0
+        w1d = r.w1.decode_tps if r.w1 else 0.0
+        w2p = r.w2.prefill_tps if r.w2 else 0.0
+        w2d = r.w2.decode_tps if r.w2 else 0.0
         print(
-            f"    noop/torchllms time={tn_total/t_total:.2f}x  "
-            f"hook_calls={noop_hook_calls}"
+            f"  {label:<24} "
+            f"{w1p:>15.1f} {w1d:>14.1f} "
+            f"{w2p:>15.1f} {w2d:>14.1f} "
+            f"{r.w3_total_s:>11.2f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Matrix runner (main entry point)
+# ---------------------------------------------------------------------------
+#
+# ``python -m torchllms.inference.throughput_bench --model {qwen3,gpt-oss}``
+# runs four cells in one process:
+#
+#   1. torchllms eager
+#   2. torchllms + decode-compile (Inductor, mode="default")
+#   3. SGLang with cudagraph enabled
+#   4. SGLang with cudagraph disabled
+#
+# Torchllms cells share one LLM instance (eager → enable_decode_compile);
+# SGLang cells load + shutdown a fresh sgl.Engine each time. Memory is
+# freed between the torch and sglang phases via ``del llm; gc.collect();
+# torch.cuda.empty_cache()`` so gpt-oss's ~10 GB weights + SGLang's
+# mem_fraction_static budget co-exist on a 32 GB GPU.
+
+
+_MODELS = {
+    "qwen3": {
+        "hf_path": "/root/qwen3-4b",
+        "ckpt": "/root/qwen3-4b/consolidated.00.pth",
+        "template_config": "qwen3_chatml_nothink.yaml",
+        "max_seq_len": 8192,
+        "stop_ids": [151645, 151643],
+        "precision": "bfloat16",
+    },
+    "gpt-oss": {
+        "hf_path": "/root/gpt-oss-20b",
+        "ckpt": "/root/gpt-oss-20b/original",
+        "template_config": None,  # Harmony path
+        "max_seq_len": 4096,
+        "stop_ids": [200012, 200002, 199999],
+        "precision": "bfloat16",
+    },
+}
+
+
+def _make_tokenize_fn(model: str):
+    cfg = _MODELS[model]
+    if model == "qwen3":
+        from transformers import AutoTokenizer
+        from pathlib import Path
+        import yaml
+        from torchllms.messages.tokenization import (
+            tokenize_conversation, TemplateConfig,
+        )
+        tpl_path = Path(__file__).resolve().parents[1] / "messages" / "configs" / cfg["template_config"]
+        template = TemplateConfig(**yaml.safe_load(open(tpl_path)))
+        hf_tok = AutoTokenizer.from_pretrained(cfg["hf_path"], trust_remote_code=True)
+
+        def tokenize_fn(conv, add_gen):
+            return tokenize_conversation(conv, hf_tok, template, add_generation_prompt=add_gen)
+        return tokenize_fn
+    else:  # gpt-oss — Harmony
+        from torchllms.messages.tokenization_harmony import tokenize_harmony_conversation
+
+        def tokenize_fn(conv, add_gen):
+            return tokenize_harmony_conversation(conv, add_generation_prompt=add_gen)
+        return tokenize_fn
+
+
+def _run_torch_cells(model: str) -> list[tuple[str, EngineResults]]:
+    """Load torchllms, bench eager + compile, tear down. Returns the two
+    EngineResults."""
+    from torchllms.inference.llm import LLM
+
+    cfg = _MODELS[model]
+    tokenize_fn = _make_tokenize_fn(model)
+
+    kwargs = dict(
+        ckpt_paths=[cfg["ckpt"]],
+        max_len=cfg["max_seq_len"],
+        device="cuda:0",
+        precision=cfg["precision"],
+    )
+    if cfg["template_config"]:
+        kwargs["template_config"] = cfg["template_config"]
+    else:
+        # gpt-oss uses Harmony; pass explicit eos + mxfp4 flag.
+        kwargs["eos_ids"] = cfg["stop_ids"]
+        kwargs["model_kwargs"] = {
+            "max_seq_len": cfg["max_seq_len"], "mxfp4": True,
+        }
+
+    print("  Loading torchllms ...", flush=True)
+    llm = LLM(**kwargs)
+    llm._ensure_cache()
+    llm.enable_prefix_cache()
+
+    cells: list[tuple[str, EngineResults]] = []
+
+    # Cell 1: eager.
+    print("\n  [1/4] torchllms eager", flush=True)
+    r = bench_engine(
+        llm, tokenize_fn, llm.tokenizer,
+        engine_label="torch-eager", kind="torchllms",
+        prefix_cache=llm.prefix_cache, stop_token_ids=cfg["stop_ids"],
+        w3_max_new=W3_MAX_NEW_DEFAULT, trials=3, warmup=1,
+    )
+    cells.append(("torch-eager", r))
+
+    # Cell 2: prefill+decode-compile.
+    # gpt-oss MoE dispatches through ``torchllms::gptoss_moe_delta``
+    # (single Dynamo-opaque custom op per layer) so compile works for
+    # both model families — see ``GptOSSMoE.forward`` and
+    # ``_gptoss_moe_delta`` in ``models/networks_gptoss.py``.
+    print("\n  [2/4] torchllms + prefill+decode-compile", flush=True)
+    # Prefill: Inductor-only + dynamic=True — one compile covers all
+    # prompt shapes (no cudagraph; see ``enable_prefill_compile``
+    # docstring for why cudagraph-prefill is deferred).
+    # Decode: reduce-overhead — Inductor + cudagraph capture on top.
+    # With PagedKVPool's stable buffers + use_cuda_graph=True decode
+    # wrapper, decode replay amortizes the per-step kernel launches.
+    llm.enable_prefill_compile(mode="default")
+    llm.enable_decode_compile(mode="reduce-overhead")
+    # Warmup: run a representative pass across W1/W2/W3 prompt shapes so
+    # Dynamo has compiled symbolic-shape kernels for the range and the
+    # decode cudagraph has captured B=1 replay state across the shape
+    # set. A single-shape 10-token warmup was insufficient — the W3
+    # cell was landing ~2× slower than apples-to-apples because the
+    # first few W3 turns paid guard-miss + compile costs on unseen
+    # shapes. With a multi-shape warmup that's amortized before any
+    # timed call runs.
+    try:
+        if llm.prefix_cache is not None:
+            llm.prefix_cache.clear()
+        for conv in (W1_CONV, W2_CONV):
+            w_ids, w_roles = tokenize_fn(conv, True)
+            w_in = torch.tensor(w_ids, device=llm.device, dtype=torch.long)
+            w_r = torch.tensor(w_roles, device=llm.device, dtype=torch.long) if w_roles else None
+            llm._generate_single(w_in, role_ids=w_r, temperature=0.0, max_new_tokens=16)
+        # W3 shapes: warm each turn's prompt once.
+        for turn_idx in range(len(W3_TURNS)):
+            conv = build_w3_history_to_turn(turn_idx + 1)
+            w_ids, w_roles = tokenize_fn(conv, True)
+            w_in = torch.tensor(w_ids, device=llm.device, dtype=torch.long)
+            w_r = torch.tensor(w_roles, device=llm.device, dtype=torch.long) if w_roles else None
+            llm._generate_single(w_in, role_ids=w_r, temperature=0.0, max_new_tokens=8)
+    except Exception as e:
+        print(f"    [warn] warmup skipped: {e}")
+    r = bench_engine(
+        llm, tokenize_fn, llm.tokenizer,
+        engine_label="torch-compile", kind="torchllms",
+        prefix_cache=llm.prefix_cache, stop_token_ids=cfg["stop_ids"],
+        w3_max_new=W3_MAX_NEW_DEFAULT, trials=3, warmup=1,
+    )
+    cells.append(("torch-compile", r))
+
+    # Tear down torchllms completely before SGLang loads.
+    print("\n  Tearing down torchllms ...", flush=True)
+    llm.disable_decode_compile()
+    llm.disable_prefill_compile()
+    del llm
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    # Clear the flashinfer wrapper cache (stateful; would hold stale
+    # ``plan`` buffers across teardown).
+    try:
+        from torchllms.models import flashinfer_attention as _fa
+        _fa._WRAPPER_CACHE.clear()
+        _fa._DECODE_WRAPPER_CACHE.clear()
+    except ImportError:
+        pass
+    return cells
+
+
+def _run_sglang_cell(model: str, *, cuda_graph: bool) -> EngineResults:
+    """Load one sgl.Engine, bench, shutdown."""
+    import sglang as sgl
+    import gc as _gc
+
+    cfg = _MODELS[model]
+    tokenize_fn = _make_tokenize_fn(model)
+    label = f"sglang-cg-{'on' if cuda_graph else 'off'}"
+    print(f"\n  [{{}}/4] {label}", flush=True)
+
+    engine = sgl.Engine(
+        model_path=cfg["hf_path"],
+        dtype=cfg["precision"],
+        mem_fraction_static=0.80,
+        context_length=cfg["max_seq_len"],
+        disable_cuda_graph=(not cuda_graph),
+    )
+
+    class _ShimTok:
+        def decode(self, ids, skip_special_tokens=True):
+            return ""
+
+    try:
+        r = bench_engine(
+            engine, tokenize_fn, _ShimTok(),
+            engine_label=label, kind="sglang",
+            prefix_cache=None, stop_token_ids=cfg["stop_ids"],
+            w3_max_new=W3_MAX_NEW_DEFAULT, trials=3, warmup=1,
+        )
+    finally:
+        sd = getattr(engine, "shutdown", None)
+        if sd is not None:
+            sd()
+        del engine
+        _gc.collect()
+        torch.cuda.empty_cache()
+    return r
+
+
+def main() -> int:
+    import argparse
+    import os
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    os.environ.setdefault("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", "1")
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    ap = argparse.ArgumentParser(
+        description="Throughput matrix: {torch eager, torch compile, "
+                    "sglang cudagraph-on, sglang cudagraph-off} × "
+                    "{W1 short/short, W2 short/long, W3 multiturn}."
+    )
+    ap.add_argument(
+        "--model", choices=list(_MODELS.keys()), required=True,
+        help="Which model to benchmark. Qwen3-4B uses ChatML templates "
+             "and 8192 context; gpt-oss-20b uses Harmony templates and "
+             "4096 context.",
+    )
+    ap.add_argument(
+        "--no-sglang", action="store_true",
+        help="Skip the two SGLang cells (torchllms eager + compile only).",
+    )
+    args = ap.parse_args()
+
+    print(f"\n==== Throughput matrix: {args.model} ====")
+
+    cells = _run_torch_cells(args.model)
+
+    if not args.no_sglang:
+        for cg in (True, False):
+            try:
+                r = _run_sglang_cell(args.model, cuda_graph=cg)
+                cells.append((f"sglang-cg-{'on' if cg else 'off'}", r))
+            except Exception as e:
+                print(f"    [warn] SGLang cg={cg} failed: {e}")
+
+    print_matrix_table(cells, model_label=args.model)
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

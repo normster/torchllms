@@ -1,225 +1,212 @@
-"""Tests for RadixKVCache: tree structure, partial-edge lookup, LRU eviction."""
+"""Tests for the Phase 2 RadixKVCache: page-ID trie backed by PagedKVPool.
+
+Covers tree structure (insert/lookup/partial-edge split), LRU eviction,
+and the refcount handoff between live rollouts and radix nodes. Does
+not test KV numeric semantics — those live in the pool / kernel tests.
+"""
 
 from __future__ import annotations
 
-import torch
+import pytest
 
-from torchllms.inference.prefix_cache import RadixKVCache, _Node
-from torchllms.models.cache import KVChunk
+from torchllms.inference.prefix_cache import RadixKVCache, RadixMatch, _Node
+from torchllms.models.paged_kv import PagedKVPool
 
 
+PAGE_SIZE = 4
+TOTAL_PAGES = 32
 N_LAYERS = 2
 N_KV_HEADS = 2
-HEAD_DIM = 4
+HEAD_DIM = 8
 
 
-def _mk_block(length: int, fill: float = 1.0, role_id: int = 1) -> KVChunk:
-    """Make a KVChunk with a recognizable fill pattern.
+def _mk_pool() -> PagedKVPool:
+    import torch
+    return PagedKVPool(
+        n_layers=N_LAYERS,
+        total_pages=TOTAL_PAGES,
+        page_size=PAGE_SIZE,
+        n_kv_heads=N_KV_HEADS,
+        head_dim=HEAD_DIM,
+        max_bsz=4,
+        device="cpu",
+        dtype=torch.float32,
+    )
 
-    The K tensor at position i contains `fill + i`, so concat/slice is
-    verifiable by inspection. V = -K.
-    """
-    base = torch.arange(length, dtype=torch.bfloat16).view(1, length, 1, 1)
-    base = base.expand(N_LAYERS, length, N_KV_HEADS, HEAD_DIM).clone()
-    k = base + fill
-    v = -k
-    role_ids = torch.full((length,), role_id, dtype=torch.long)
-    return KVChunk(k=k, v=v, role_ids=role_ids)
+
+def _tokens(n: int, start: int = 0) -> tuple:
+    """Distinct token IDs so trie paths are deterministic."""
+    return tuple(range(start, start + n))
 
 
-def _block_for_range(start: int, end: int, fill: float = 1.0, role_id: int = 1) -> KVChunk:
-    """Make a block whose per-position values encode absolute token positions.
-
-    Useful when testing splits: each block is a slice of a virtual 'prefix
-    block' and its values should be preserved exactly after split/concat.
-    """
-    length = end - start
-    positions = torch.arange(start, end, dtype=torch.bfloat16).view(1, length, 1, 1)
-    positions = positions.expand(N_LAYERS, length, N_KV_HEADS, HEAD_DIM).clone()
-    k = positions + fill
-    v = -k
-    role_ids = torch.full((length,), role_id, dtype=torch.long)
-    return KVChunk(k=k, v=v, role_ids=role_ids)
+def _alloc_pages(pool: PagedKVPool, n: int) -> list[int]:
+    """Return ``n`` fresh page IDs with ref=1 each (simulating a
+    rollout's block table)."""
+    return [pool._alloc_page() for _ in range(n)]
 
 
 # ------------------------------------------------------------------
-# KVChunk basics
+# Empty-trie behavior
 # ------------------------------------------------------------------
 
 
-def test_kvblock_size_bytes_matches_tensors():
-    b = _mk_block(10)
-    expected = b.k.element_size() * b.k.numel()
-    expected += b.v.element_size() * b.v.numel()
-    expected += b.role_ids.element_size() * b.role_ids.numel()
-    assert b.size_bytes == expected
-
-
-def test_kvblock_slice_and_concat_roundtrip():
-    full = _block_for_range(0, 10)
-    head = full.slice(0, 4)
-    tail = full.slice(4, 10)
-    assert head.length == 4 and tail.length == 6
-    rejoined = KVChunk.concat([head, tail])
-    assert torch.equal(rejoined.k, full.k)
-    assert torch.equal(rejoined.v, full.v)
-    assert torch.equal(rejoined.role_ids, full.role_ids)
-
-
-# ------------------------------------------------------------------
-# Empty / single-insert behavior
-# ------------------------------------------------------------------
-
-
-def test_empty_cache_miss():
-    c = RadixKVCache(max_bytes=1 << 30)
-    m = c.lookup([1, 2, 3])
+def test_empty_lookup_returns_no_hit():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    m = radix.lookup(_tokens(10))
     assert not m.hit
     assert m.length == 0
+    assert m.page_ids == ()
 
 
-def test_single_insert_exact_match():
-    c = RadixKVCache(max_bytes=1 << 30)
-    tokens = [1, 2, 3, 4]
-    block = _mk_block(4)
-    c.insert(tokens, block)
-    m = c.lookup(tokens)
-    assert m.hit and m.length == 4
-    mat = m.materialize()
-    assert torch.equal(mat.k, block.k)
-    assert torch.equal(mat.v, block.v)
+def test_empty_insert_is_noop():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    radix.insert((), ())
+    assert radix.num_nodes() == 1
+    assert radix.num_pages() == 0
 
 
-def test_lookup_longer_than_stored_falls_back_to_prefix():
-    c = RadixKVCache(max_bytes=1 << 30)
-    c.insert([1, 2, 3, 4], _mk_block(4))
-    m = c.lookup([1, 2, 3, 4, 5, 6])
+def test_insert_page_alignment_required():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    pages = _alloc_pages(pool, 2)  # 2 pages = 8 tokens worth
+    with pytest.raises(ValueError, match="page alignment|len.tokens.*page_size"):
+        radix.insert(_tokens(7), pages)  # 7 tokens ≠ 8
+
+
+# ------------------------------------------------------------------
+# Basic insert/lookup
+# ------------------------------------------------------------------
+
+
+def test_single_insert_adopts_pages():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    pages = _alloc_pages(pool, 3)
+    tokens = _tokens(12)
+    radix.insert(tokens, pages)
+    assert radix.num_pages() == 3
+    # Radix bumped each page's refcount from 1 → 2.
+    assert all(pool.page_refcount(p) == 2 for p in pages)
+
+
+def test_lookup_returns_matched_prefix():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    pages = _alloc_pages(pool, 4)
+    radix.insert(_tokens(16), pages)
+    m = radix.lookup(_tokens(16))
+    assert m.hit
+    assert m.length == 16
+    assert m.page_ids == tuple(pages)
+
+
+def test_lookup_partial_match_truncates_to_page_boundary():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    pages = _alloc_pages(pool, 4)  # 4 pages = 16 tokens
+    radix.insert(_tokens(16), pages)
+    # Query 11 tokens matches token-for-token but must truncate to 8
+    # (2 full pages) since page_size=4 and match ends mid-page.
+    m = radix.lookup(_tokens(11))
+    assert m.length == 8
+    assert m.page_ids == tuple(pages[:2])
+
+
+def test_insert_skips_silently_on_sub_page_divergence():
+    """Two sequences share < page_size tokens; neither can fully own
+    the shared page. Second insert drops its suffix silently."""
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    # First sequence: 8 tokens, 2 pages.
+    pages_a = _alloc_pages(pool, 2)
+    tokens_a = _tokens(8, start=0)  # [0..8)
+    radix.insert(tokens_a, pages_a)
+    # Second sequence: shares first 2 tokens only (sub-page), diverges.
+    pages_b = _alloc_pages(pool, 2)
+    tokens_b = _tokens(2, start=0) + _tokens(6, start=100)
+    radix.insert(tokens_b, pages_b)  # should not raise
+    # Only the first insert is visible.
+    m_a = radix.lookup(tokens_a)
+    assert m_a.length == 8 and m_a.page_ids == tuple(pages_a)
+    m_b = radix.lookup(tokens_b)
+    assert m_b.length == 0  # no page-aligned match for B's variant
+    # pages_b are still held by the caller (ref=1 each); they'll go
+    # back to the free list once caller releases.
+    assert all(pool.page_refcount(p) == 1 for p in pages_b)
+
+
+def test_lookup_misses_on_first_token_divergence():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    pages = _alloc_pages(pool, 2)
+    radix.insert(_tokens(8, start=0), pages)
+    m = radix.lookup(_tokens(8, start=100))
+    assert not m.hit
+
+
+# ------------------------------------------------------------------
+# Branching / split
+# ------------------------------------------------------------------
+
+
+def test_insert_shared_prefix_splits_edge():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    # First insert: tokens [0, 1, 2, 3, 4, 5, 6, 7] → pages A, B.
+    tokens_a = _tokens(8, start=0)
+    pages_a = _alloc_pages(pool, 2)
+    radix.insert(tokens_a, pages_a)
+    # Second insert sharing the first 4 tokens but diverging:
+    # [0, 1, 2, 3, 100, 101, 102, 103] → pages C, D.
+    tokens_b = _tokens(4, start=0) + _tokens(4, start=100)
+    pages_b = _alloc_pages(pool, 2)
+    radix.insert(tokens_b, pages_b)
+    # Structure should be root → (shared 4t, 1 page) → two children.
+    # Either the first tokens_a node got split at page 1, or the root
+    # now has a shared-prefix node with two children.
+    m_a = radix.lookup(tokens_a)
+    m_b = radix.lookup(tokens_b)
+    assert m_a.length == 8 and m_a.page_ids == tuple(pages_a)
+    assert m_b.length == 8 and m_b.page_ids == tuple(pages_b[:0]) + (pages_a[0],) + tuple(pages_b[1:])
+    # Common prefix: page A is shared.
+    # (Page A owned by 2 refs: one per insert's borrow? Actually radix
+    # only holds 1 ref on page A — the shared-prefix node owns it.)
+    assert pool.page_refcount(pages_a[0]) == 2  # rollout + radix
+    # pages_a[1] (only in the A branch) has ref 2.
+    assert pool.page_refcount(pages_a[1]) == 2
+
+
+def test_lookup_shared_prefix_returns_page_aligned_shared():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    pages_a = _alloc_pages(pool, 2)
+    radix.insert(_tokens(8), pages_a)
+    # Look up a prompt that shares the first 6 tokens — page-aligned
+    # match should be 4 (one page).
+    m = radix.lookup(_tokens(6))
     assert m.length == 4
-    assert m.materialize().length == 4
-
-
-def test_insert_empty_is_noop():
-    c = RadixKVCache(max_bytes=1 << 30)
-    c.insert([], _mk_block(0) if False else KVChunk(
-        k=torch.zeros(N_LAYERS, 0, N_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16),
-        v=torch.zeros(N_LAYERS, 0, N_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16),
-        role_ids=torch.zeros(0, dtype=torch.long),
-    ))
-    assert c.total_bytes == 0
-    assert c.num_nodes() == 1  # just root
+    assert m.page_ids == (pages_a[0],)
 
 
 # ------------------------------------------------------------------
-# Split on divergence
+# Leaf extension (compression)
 # ------------------------------------------------------------------
 
 
-def test_insert_diverging_sibling_splits_edge():
-    c = RadixKVCache(max_bytes=1 << 30)
-    a_tokens = [10, 11, 12, 13, 14]  # 5 tokens
-    b_tokens = [10, 11, 99, 98]      # shared prefix len 2
-    a_block = _block_for_range(0, 5)
-    b_block = _block_for_range(0, 4, role_id=2)
-    c.insert(a_tokens, a_block)
-    c.insert(b_tokens, b_block)
-
-    # Both prefixes retrievable.
-    ma = c.lookup(a_tokens)
-    mb = c.lookup(b_tokens)
-    assert ma.length == 5 and mb.length == 4
-
-    # Materialization preserves values.
-    ka = ma.materialize()
-    kb = mb.materialize()
-    assert torch.equal(ka.k, a_block.k)
-    assert torch.equal(kb.k, b_block.k)
-
-    # Structure: shared root -> split_node(2 tokens) -> {a_tail(3), b_tail(2)}
-    root_child = c._root.children[10]
-    assert root_child.edge_tokens == (10, 11)
-    assert len(root_child.children) == 2
-
-
-def test_insert_endpoint_on_split_boundary():
-    """Inserting a shorter prefix that lands exactly on a split creates no
-    extra node; the split node IS the prefix endpoint."""
-    c = RadixKVCache(max_bytes=1 << 30)
-    c.insert([1, 2, 3, 4, 5], _block_for_range(0, 5))
-    c.insert([1, 2], _block_for_range(0, 2, role_id=2))
-
-    m = c.lookup([1, 2])
-    assert m.length == 2
-    # The split created a node at depth 2 that is also the [1,2] endpoint.
-    # Lookup for [1, 2] returns a full-edge match (not partial).
-    assert m._last_edge_consumed == 2
-
-
-# ------------------------------------------------------------------
-# Partial-edge lookup (does NOT mutate the tree)
-# ------------------------------------------------------------------
-
-
-def test_partial_edge_match_reports_correct_length():
-    c = RadixKVCache(max_bytes=1 << 30)
-    c.insert([1, 2, 3, 4, 5], _block_for_range(0, 5))
-    before_nodes = c.num_nodes()
-    m = c.lookup([1, 2, 3, 99])  # diverges at pos 3
-    assert m.length == 3
-    assert c.num_nodes() == before_nodes  # tree unchanged
-    mat = m.materialize()
-    assert mat.length == 3
-    # Values preserved: K at position i == i + 1.0
-    expected = _block_for_range(0, 3)
-    assert torch.equal(mat.k, expected.k)
-
-
-def test_partial_edge_then_insert_splits_at_that_point():
-    c = RadixKVCache(max_bytes=1 << 30)
-    c.insert([1, 2, 3, 4, 5], _block_for_range(0, 5))
-    _ = c.lookup([1, 2, 3, 99])  # partial, no mutation
-    # Now actually insert the diverging prefix
-    c.insert([1, 2, 3, 99, 100], _block_for_range(0, 5, role_id=2))
-    ma = c.lookup([1, 2, 3, 4, 5])
-    mb = c.lookup([1, 2, 3, 99, 100])
-    assert ma.length == 5
-    assert mb.length == 5
-
-
-# ------------------------------------------------------------------
-# Leaf extension (chain avoidance)
-# ------------------------------------------------------------------
-
-
-def test_extending_prefix_rewrites_same_leaf_not_new_chain():
-    c = RadixKVCache(max_bytes=1 << 30)
-    c.insert([1, 2, 3], _block_for_range(0, 3))
-    nodes_before = c.num_nodes()
-    assert nodes_before == 2  # root + one leaf
-
-    # Turn 2: extend same prefix with more tokens.
-    c.insert([1, 2, 3, 4, 5], _block_for_range(0, 5))
-    nodes_after = c.num_nodes()
-    assert nodes_after == 2  # still just root + one leaf, edge extended
-
-    m = c.lookup([1, 2, 3, 4, 5])
-    assert m.length == 5
-    mat = m.materialize()
-    # Values from the latest insert (which is the full-prefix block)
-    assert torch.equal(mat.k, _block_for_range(0, 5).k)
-
-
-def test_extending_then_branching_still_finds_both_prefixes():
-    c = RadixKVCache(max_bytes=1 << 30)
-    c.insert([1, 2, 3], _block_for_range(0, 3))
-    c.insert([1, 2, 3, 4, 5], _block_for_range(0, 5))
-    # Now a sibling branches at position 3
-    c.insert([1, 2, 3, 99], _block_for_range(0, 4, role_id=3))
-
-    assert c.lookup([1, 2, 3, 4, 5]).length == 5
-    assert c.lookup([1, 2, 3, 99]).length == 4
-    # Partial match at common prefix
-    m = c.lookup([1, 2, 3])
-    assert m.length == 3
+def test_leaf_extension_appends_to_existing_node():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    pages_a = _alloc_pages(pool, 1)
+    radix.insert(_tokens(4), pages_a)
+    # Extending the same leaf with more tokens — leaf-extension rule
+    # merges into one node rather than chaining.
+    pages_b = _alloc_pages(pool, 2)
+    radix.insert(_tokens(12), pages_a + pages_b)
+    assert radix.num_nodes() == 2  # root + one leaf
+    m = radix.lookup(_tokens(12))
+    assert m.length == 12
 
 
 # ------------------------------------------------------------------
@@ -227,99 +214,118 @@ def test_extending_then_branching_still_finds_both_prefixes():
 # ------------------------------------------------------------------
 
 
-def test_lru_evicts_oldest_leaf_when_over_budget():
-    # Each block is L=4 tokens. n_layers=2, 2 kv_heads, head_dim=4.
-    # K,V: 2 * (2*4*2*4) * 2 bytes (bf16) = 128 bytes each
-    # role_ids: 4 * 8 bytes = 32 bytes
-    # Total per block ~= 288 bytes.
-    # Set budget to 2 blocks.
-    per_block = _mk_block(4).size_bytes
-    c = RadixKVCache(max_bytes=per_block * 2 + 16)
-
-    c.insert([1, 2, 3, 4], _mk_block(4))     # oldest
-    c.insert([5, 6, 7, 8], _mk_block(4, fill=10.0))
-    c.insert([9, 10, 11, 12], _mk_block(4, fill=20.0))  # should evict [1..4]
-
-    assert not c.lookup([1, 2, 3, 4]).hit
-    assert c.lookup([5, 6, 7, 8]).hit
-    assert c.lookup([9, 10, 11, 12]).hit
-
-
-def test_lru_access_updates_recency():
-    per_block = _mk_block(4).size_bytes
-    c = RadixKVCache(max_bytes=per_block * 2 + 16)
-
-    c.insert([1, 2, 3, 4], _mk_block(4))
-    c.insert([5, 6, 7, 8], _mk_block(4, fill=10.0))
-    # Touch [1..4] so it becomes most-recently-accessed.
-    assert c.lookup([1, 2, 3, 4]).hit
-    c.insert([9, 10, 11, 12], _mk_block(4, fill=20.0))  # should evict [5..8]
-
-    assert c.lookup([1, 2, 3, 4]).hit
-    assert not c.lookup([5, 6, 7, 8]).hit
-    assert c.lookup([9, 10, 11, 12]).hit
+def test_evict_releases_pages_to_pool():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    pages_a = _alloc_pages(pool, 1)
+    pages_b = _alloc_pages(pool, 1)
+    radix.insert(_tokens(4, start=0), pages_a)
+    radix.insert(_tokens(4, start=100), pages_b)
+    # Touch pages_a to make pages_b the LRU leaf.
+    radix.lookup(_tokens(4, start=0))
+    # Simulate caller dropping their refs so radix is the only holder.
+    pool.release_pages(pages_a)
+    pool.release_pages(pages_b)
+    assert pool.page_refcount(pages_a[0]) == 1  # radix only
+    assert pool.page_refcount(pages_b[0]) == 1
+    n = radix.evict_oldest()
+    assert n == 1
+    assert pool.page_refcount(pages_b[0]) == 0
+    # pages_a survives.
+    assert pool.page_refcount(pages_a[0]) == 1
 
 
-def test_eviction_compacts_singleton_parent():
-    """After split + sibling eviction, the remaining chain compacts into one
-    edge so the tree matches its ideal shape."""
-    per_block = _mk_block(3).size_bytes
-    c = RadixKVCache(max_bytes=10 * per_block)
+def test_evict_returns_zero_on_empty_trie():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    assert radix.evict_oldest() == 0
 
-    # After these two inserts, tree has: root -> split(2) -> {tail_a(3), tail_b(2)}
-    c.insert([1, 2, 3, 4, 5], _block_for_range(0, 5))
-    c.insert([1, 2, 9, 10], _block_for_range(0, 4, role_id=2))
-    assert c.num_nodes() == 4  # root + split + 2 leaves
 
-    # Tighten budget so tail_b gets evicted. Recent-most should be [1,2,9,10]
-    # by insertion order; touch [1..5] to make it newer, so [1,2,9,10] is
-    # older and gets evicted.
-    c.lookup([1, 2, 3, 4, 5])
-    # Budget just below total; force one eviction
-    c.max_bytes = c.total_bytes - 1
-    c._evict_if_needed()
-
-    # After eviction, split_node has only tail_a as its remaining child;
-    # compaction merges split_node with tail_a. Tree should be root -> one leaf.
-    assert c.num_nodes() == 2
-    # The remaining leaf's path materializes to the original 5-token block.
-    m = c.lookup([1, 2, 3, 4, 5])
-    assert m.length == 5
-    assert torch.equal(m.materialize().k, _block_for_range(0, 5).k)
+def test_clear_releases_everything():
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    pages_a = _alloc_pages(pool, 2)
+    radix.insert(_tokens(8), pages_a)
+    pool.release_pages(pages_a)  # caller drops refs
+    radix.clear()
+    assert radix.num_pages() == 0
+    for p in pages_a:
+        assert pool.page_refcount(p) == 0
 
 
 # ------------------------------------------------------------------
-# Multi-turn rollout flow
+# Refcount handoff on a complete rollout→retire→insert cycle
 # ------------------------------------------------------------------
 
 
-def test_multi_turn_rollout_reuses_prefix():
-    c = RadixKVCache(max_bytes=1 << 30)
-    # Turn 1: insert prompt + response
-    c.insert(list(range(10)), _block_for_range(0, 10))
-    # Turn 2 starts with prior prompt + response + tool result (new tokens 10..19)
-    turn2_tokens = list(range(20))
-    m = c.lookup(turn2_tokens)
-    assert m.length == 10  # reused the prior turn
-    prior = m.materialize()
-    assert torch.equal(prior.k, _block_for_range(0, 10).k)
-    # Turn 2 inserts the new full prefix (20 tokens)
-    c.insert(turn2_tokens, _block_for_range(0, 20))
-    m2 = c.lookup(turn2_tokens)
-    assert m2.length == 20
+def test_retire_insert_release_preserves_radix_ref():
+    """Full rollout lifecycle: alloc fresh pages (ref=1), retire (return
+    page list without decrementing), insert into radix (radix bumps
+    ref→2), release (ref→1, held only by radix)."""
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+    rid = pool.claim()
+    pool.extend(rid, 8)  # 2 pages, fresh
+    pages_before = list(pool.pages_of(rid))
+    assert all(pool.page_refcount(p) == 1 for p in pages_before)
+
+    pages, seqlen = pool.retire_pages(rid)
+    assert pages == pages_before
+    assert seqlen == 8
+
+    radix.insert(_tokens(8), pages)
+    # Radix bumped ref 1→2 on each page.
+    assert all(pool.page_refcount(p) == 2 for p in pages)
+
+    pool.release_pages(pages)
+    # Caller released — each page now held only by radix.
+    assert all(pool.page_refcount(p) == 1 for p in pages)
+    # None are in the free list.
+    assert not any(p in pool._free_pages for p in pages)
 
 
-if __name__ == "__main__":
-    import sys
-    # Minimal stdlib-ish runner so this works without pytest on the machine.
-    failures = 0
-    for name, fn in list(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-            print(f"{name}: ok")
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"{name}: FAIL - {type(e).__name__}: {e}")
-    sys.exit(1 if failures else 0)
+def test_lookup_hit_then_retire_handles_shared_pages_correctly():
+    """Second rollout borrows pages from radix, extends, retires; the
+    re-insert should NOT double-bump the shared pages' refcount."""
+    pool = _mk_pool()
+    radix = RadixKVCache(pool)
+
+    # First rollout: creates the prefix.
+    r1 = pool.claim()
+    pool.extend(r1, 8)
+    pages1 = list(pool.pages_of(r1))
+    pages_ret1, _ = pool.retire_pages(r1)
+    radix.insert(_tokens(8), pages_ret1)
+    pool.release_pages(pages_ret1)
+    # pages1: ref=1 each (radix only).
+
+    # Second rollout: prefix-matches, extends with fresh pages.
+    r2 = pool.claim()
+    m = radix.lookup(_tokens(8))
+    assert m.length == 8
+    pool.borrow_pages(m.page_ids)
+    pool.attach_borrowed_pages(r2, m.page_ids)
+    # Shared pages: ref=2 (radix + r2). Extend with a fresh page.
+    pool.extend(r2, PAGE_SIZE)
+    pages2 = pool.pages_of(r2)
+    fresh = pages2[2]  # new page allocated on extend
+    assert pool.page_refcount(fresh) == 1
+
+    # Retire r2 and insert extended prefix (12 tokens, 3 pages).
+    tokens_ext = _tokens(8) + _tokens(4, start=8)
+    pages_ret2, _ = pool.retire_pages(r2)
+    radix.insert(tokens_ext, pages_ret2)
+    # Shared pages (already in trie): no ref change from re-insert —
+    # still at (radix + r2-borrow) = 2.
+    assert pool.page_refcount(pages1[0]) == 2
+    assert pool.page_refcount(pages1[1]) == 2
+    # Fresh page was adopted by the new edge: ref 1 → 2.
+    assert pool.page_refcount(fresh) == 2
+
+    pool.release_pages(pages_ret2)
+    # After release: all three pages drop by 1. All end up at 1,
+    # held only by the radix (pages1[0,1] by the split-point node, fresh
+    # by the tail node).
+    assert pool.page_refcount(pages1[0]) == 1
+    assert pool.page_refcount(pages1[1]) == 1
+    assert pool.page_refcount(fresh) == 1

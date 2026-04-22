@@ -1,24 +1,33 @@
-"""torch.library wrappers for the decode hot-path ops.
+"""torch.library wrappers for inference hot-path kernels.
 
-Two wrappers, both thin:
+Each entry is a thin wrapper around a backend kernel (flash-attn /
+flashinfer) registered as a ``torch.library.custom_op`` so Dynamo can
+trace through the pybind and cudagraph capture sees the correct
+mutation semantics.
 
-- ``fa_with_kvcache`` wraps ``flash_attn.flash_attn_with_kvcache`` as a
-  registered custom op so Dynamo can trace through the FA2 pybind. FA2
-  upstream doesn't register itself in ``torch.library`` (FA3 does), so
-  without this wrapper a ``torch.compile``'d forward graph-breaks at the
-  attention call. ``mutates_args=()`` because our callers pass read-only
-  cache views (the KV scatter happens separately in ``update_kv_decode``).
+Entries:
 
-- ``update_kv_decode`` wraps the decode-step scatter: write new K/V into
-  the cache slab at each row's current ``seen_tokens`` position, advance
-  the counter, return the full per-layer cache slabs + the pre-update
-  ``cache_seqlens`` for FA2. The ``mutates_args`` annotation tells Dynamo
-  and the cudagraph-safety checker which buffers are being written in
-  place so capture doesn't fail with spurious stale-read warnings.
+- ``fa_with_kvcache`` — ``flash_attn.flash_attn_with_kvcache`` read-only
+  on the KV cache (the KV scatter lives in ``update_kv_decode``).
+  **Legacy**: only used by KVArena-backed attention (gpt-oss, olmo).
 
-The function bodies match what ``KVArena.update_kv_decode`` (formerly
-``update_kv_decode_static``) and ``_flash_attention_with_kvcache`` did
-before; only the op boundary is new.
+- ``update_kv_decode`` — KVArena decode-step scatter: write new K/V at
+  each row's ``seen_tokens`` position, advance the counter, return the
+  fresh ``cache_seqlens``. ``mutates_args`` tells the cudagraph safety
+  pass which buffers are being written in place. **Legacy** (KVArena).
+
+- ``update_role_ids_decode`` / ``update_attn_mask_decode`` /
+  ``extend_attn_mask_decode`` — KVArena role/attn_mask scratch scatters,
+  wrapped so Inductor doesn't elide them as dead code. **Legacy**
+  (KVArena only; base Transformer paged path doesn't use these scratches).
+
+- ``paged_append_kv`` — ``flashinfer.append_paged_kv_cache`` wrapper for
+  the paged pool. Mutates the paged K/V slabs via the kernel's per-token
+  (batch_indices, positions) scatter. Primary KV write op for Qwen3 and
+  any future paged-backend model.
+
+Legacy ops stay registered until Phase 4 migrates gpt-oss + olmo to the
+paged pool. They have no runtime cost when unused.
 """
 
 from __future__ import annotations
@@ -193,4 +202,69 @@ def extend_attn_mask_decode(
 
 @extend_attn_mask_decode.register_fake
 def _(attn_mask_cache, seen_tokens, b_live):
+    return None
+
+
+# =====================================================================
+# Paged KV append (mutates paged K/V slabs, wraps flashinfer)
+# =====================================================================
+#
+# ``flashinfer.append_paged_kv_cache`` scatters new K/V tokens into the
+# paged pool given per-token (batch_indices, positions) tensors. The
+# kernel reads kv_indices / kv_indptr / kv_last_page_len to find the
+# right page for each token.
+#
+# Wrapped as a custom op with ``mutates_args`` on the paged slabs so
+# Dynamo treats this as a side-effecting call, cudagraph capture knows
+# to pin the buffers, and the write isn't elided as dead code when the
+# caller doesn't consume the slab in the output graph (it consumes it
+# later via ``.run()`` on the flashinfer wrapper, which reads the slab
+# as a plain tensor).
+
+
+@custom_op(
+    "torchllms::paged_append_kv",
+    mutates_args={"paged_k_cache", "paged_v_cache"},
+)
+def paged_append_kv(
+    paged_k_cache: Tensor,  # [n_layers, total_pages, page_size, n_kv, d]
+    paged_v_cache: Tensor,  # same
+    layer_id: int,
+    append_key: Tensor,     # [total_new_tokens, n_kv_heads, head_dim]
+    append_value: Tensor,   # same
+    batch_indices: Tensor,  # [total_new_tokens] int32
+    positions: Tensor,      # [total_new_tokens] int32
+    kv_indices: Tensor,     # [total_pages] int32 (pool's _kv_indices_buf)
+    kv_indptr: Tensor,      # [B+1] int32 (pool's _kv_indptr_buf[:B+1])
+    kv_last_page_len: Tensor,  # [B] int32 (pool's _kv_last_page_len_buf[:B])
+) -> None:
+    """Scatter ``[total_new_tokens, n_kv, d]`` K/V into the paged slabs
+    at (batch_indices, positions), using the per-batch page list.
+
+    The layer slice happens INSIDE the op body so the argument seen by
+    Dynamo/Inductor is the full 5D ``[n_layers, ...]`` slab (which is
+    ``mark_static_address``'d by ``PagedKVPool``). If we sliced at the
+    call site (``self.k_cache[layer_id]``), Inductor would treat the
+    view as a non-static input and refuse cudagraph capture with
+    ``skipping cudagraphs due to mutated inputs``.
+    """
+    import flashinfer
+    flashinfer.append_paged_kv_cache(
+        append_key=append_key,
+        append_value=append_value,
+        batch_indices=batch_indices,
+        positions=positions,
+        paged_kv_cache=(paged_k_cache[layer_id], paged_v_cache[layer_id]),
+        kv_indices=kv_indices,
+        kv_indptr=kv_indptr,
+        kv_last_page_len=kv_last_page_len,
+        kv_layout="NHD",
+    )
+
+
+@paged_append_kv.register_fake
+def _(
+    paged_k_cache, paged_v_cache, layer_id, append_key, append_value,
+    batch_indices, positions, kv_indices, kv_indptr, kv_last_page_len,
+):
     return None

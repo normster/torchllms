@@ -22,9 +22,10 @@
 # limitations under the License.
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, List, Literal, Optional
+from typing import List, Optional, Set
 
 try:
     from flash_attn import flash_attn_func, flash_attn_with_kvcache
@@ -39,29 +40,65 @@ import torch.nn.functional as F
 from pydantic import BaseModel
 
 from torchllms.messages import Role
-from torchllms.models import compile_ops, utils
-from torchllms.models.cache import KVArena
+from torchllms.models import utils
+from torchllms.models.paged_kv import PagedKVPool
 
 
-@dataclass(frozen=True)
-class HookContext:
-    """Metadata passed to activation-intervention hooks.
+def _as_int_tuple(value) -> tuple[int, ...]:
+    """Normalize a layer or role spec to a tuple of ints."""
+    if isinstance(value, Role):
+        return (int(value),)
+    if isinstance(value, int):
+        return (int(value),)
+    return tuple(int(v) for v in value)
 
-    All tensor fields describe only the active tokens in the current forward
-    call. Cached-prefix positions are intentionally not exposed here. Hooks
-    that need to distinguish prefill from decode can check
-    ``input_ids.shape[1]``: decode always passes ``T_active == 1``.
+
+class Intervention(nn.Module):
+    """Wraps an activation-intervention module with dispatch metadata.
+
+    Users normally don't instantiate this directly; call
+    :meth:`Transformer.register_intervention` which builds the wrapper.
+
+    The wrapped ``module``'s ``forward(hidden)`` must return a tensor
+    that broadcasts to ``hidden.shape``. The driver applies
+    ``hidden = hidden + mask * module(hidden)`` at each layer in
+    ``layers``, gated by ``role_ids`` (or unconditionally if ``role_ids
+    is None``).
     """
 
-    layer_id: int
-    site: Literal["post_block"]
-    input_ids: torch.Tensor
-    role_ids: Optional[torch.Tensor]
-    input_pos: Optional[torch.Tensor]
-    alpha: Optional[float] = None
+    def __init__(
+        self,
+        module: nn.Module,
+        *,
+        layers: int | Sequence[int],
+        role_ids=None,
+    ) -> None:
+        super().__init__()
+        self.module = module
+        ls = _as_int_tuple(layers)
+        if not ls:
+            raise ValueError("layers must be non-empty")
+        # Tuple supports `in` natively; a set isn't worth the overhead for
+        # the typical 1–4 layer configs.
+        self.layers: tuple[int, ...] = ls
+        if role_ids is None:
+            self.role_ids: Optional[tuple[int, ...]] = None
+            self.register_buffer(
+                "_roles_t", torch.empty(0, dtype=torch.long), persistent=False,
+            )
+        else:
+            rs = _as_int_tuple(role_ids)
+            if not rs:
+                raise ValueError("role_ids must be None or non-empty")
+            self.role_ids = rs
+            self.register_buffer(
+                "_roles_t",
+                torch.tensor(rs, dtype=torch.long),
+                persistent=False,
+            )
 
-
-ActivationHook = Callable[[torch.Tensor, HookContext], torch.Tensor]
+    def extra_repr(self) -> str:
+        return f"layers={self.layers}, role_ids={self.role_ids}"
 
 
 class AttentionImpl(Enum):
@@ -468,8 +505,9 @@ class Attention(nn.Module):
         x: torch.Tensor,
         role_ids: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[KVArena] = None,
+        cache: Optional[PagedKVPool] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        paged_ctx: Optional["PagedContext"] = None,  # noqa: F821
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -485,28 +523,9 @@ class Attention(nn.Module):
         xq = self.rope(xq, input_pos=input_pos)
         xk = self.rope(xk, input_pos=input_pos)
 
-        # Decode-step fast path: qlen == 1 with FA2 available. The KV
-        # scatter + attention both run through torch.library-registered
-        # custom ops in ``torchllms.models.compile_ops`` so Dynamo can
-        # trace and cudagraph-capture the call sequence. Cache tensors
-        # keep their full [B, max_seqlen, ...] shape across steps.
-        # Everything else (prefill, SDPA, eager, no cache) takes the
-        # slice-returning ``update_kv`` + dispatch-by-attention-impl path.
-        if (
-            cache is not None
-            and seqlen == 1
-            and self.params.attention_impl == AttentionImpl.FLASH
-            and compile_ops.fa_with_kvcache is not None
-        ):
-            xk, xv, cache_seqlens = cache.update_kv_decode(
-                self.layer_id, xk, xv,
-            )
-            bsz_, qlen_, n_heads_, head_dim_ = xq.shape
-            out_4d = compile_ops.fa_with_kvcache(xq, xk, xv, cache_seqlens)
-            output = out_4d.reshape(bsz_, qlen_, n_heads_ * head_dim_)
-        else:
-            if cache is not None:
-                xk, xv = cache.update_kv(self.layer_id, xk, xv)
+        if cache is None:
+            # Training / no-cache inference: FA/SDPA/eager over raw QKV.
+            # attn_mask flows through here; FA path asserts None.
             if self.params.attention_impl == AttentionImpl.FLASH:
                 assert attn_mask is None
                 output = _flash_attention(xq, xk, xv)
@@ -514,6 +533,27 @@ class Attention(nn.Module):
                 output = _sdpa_attention(xq, xk, xv, attn_mask)
             else:
                 output = _eager_attention(xq, xk, xv, attn_mask)
+        else:
+            # Paged path — single codepath for prefill + decode via
+            # flashinfer's batched-paged wrappers. Per-row diverging KV
+            # lengths are handled by ``kv_indptr`` / ``kv_last_page_len``
+            # inside the planned wrapper, not by kernel-level cache_seqlens.
+            # ``paged_ctx`` carries the pre-planned wrapper + the layout
+            # used for both the KV scatter and the attention run.
+            if paged_ctx is None:
+                raise RuntimeError(
+                    "Paged cache requires paged_ctx; Transformer.forward "
+                    "must build it before the layer loop."
+                )
+            n_kv = self.params.n_kv_heads
+            n_q = self.params.n_heads
+            d = self.params.head_dim
+            k_flat = xk.reshape(bsz * seqlen, n_kv, d)
+            v_flat = xv.reshape(bsz * seqlen, n_kv, d)
+            cache.append_kv(self.layer_id, k_flat, v_flat, paged_ctx.layout)
+            q_flat = xq.reshape(bsz * seqlen, n_q, d)
+            out_flat = paged_ctx.run(self.layer_id, q_flat)
+            output = out_flat.reshape(bsz, seqlen, n_q * d)
 
         return self.wo(output)
 
@@ -589,7 +629,8 @@ class TransformerBlock(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[KVArena] = None,
+        cache: Optional[PagedKVPool] = None,
+        paged_ctx: Optional["PagedContext"] = None,  # noqa: F821
     ):
         h = x + self.attention(
             x=self.attention_norm(x),
@@ -597,6 +638,7 @@ class TransformerBlock(nn.Module):
             attn_mask=attn_mask,
             input_pos=input_pos,
             cache=cache,
+            paged_ctx=paged_ctx,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -651,70 +693,174 @@ class Transformer(nn.Module):
             self.output = lambda x: nn.functional.linear(x, self.tok_embeddings.weight)
         else:
             self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
-        self.activation_hooks: List[ActivationHook] = []
-        self.activation_hook_modules = nn.ModuleList()
-        self.activation_hook_alpha: Optional[float] = None
+        self.interventions = nn.ModuleList()
 
-    def set_activation_hooks(
+    def register_intervention(
         self,
-        hooks: ActivationHook | List[ActivationHook],
+        module: nn.Module,
         *,
-        alpha: Optional[float] = None,
+        layers: int | Sequence[int],
+        role_ids=None,
     ) -> None:
-        if callable(hooks):
-            hooks = [hooks]
-        self.activation_hooks = list(hooks)
-        self.activation_hook_modules = nn.ModuleList(
-            hook for hook in self.activation_hooks if isinstance(hook, nn.Module)
-        )
-        self.activation_hook_alpha = None if alpha is None else float(alpha)
+        """Install a delta-producing module as an activation intervention.
 
-    def clear_activation_hooks(self) -> None:
-        self.activation_hooks = []
-        self.activation_hook_modules = nn.ModuleList()
-        self.activation_hook_alpha = None
+        At each post-block site in ``layers``, the driver computes
+        ``hidden = hidden + mask * module(hidden)``. When ``role_ids`` is
+        a set of role IDs, ``mask`` is 1 at positions whose role is in
+        that set and 0 elsewhere. When ``role_ids is None``, the
+        intervention fires unconditionally.
 
-    def _apply_activation_hooks(
+        Multiple interventions compose: they are applied in registration
+        order.
+
+        The module is moved to the Transformer's current device/dtype
+        (tracked via the token-embedding weight) and its parameters are
+        marked ``requires_grad=False`` — these are inference-time
+        interventions, not trainable params of the host model.
+
+        Changing the installed set of interventions invalidates any
+        ``torch.compile`` cache held by a driver (e.g.
+        ``LLM._compiled_decode_model``); reinstall compile after a
+        register/clear.
+        """
+        target_dtype = self.tok_embeddings.weight.dtype
+        target_device = self.tok_embeddings.weight.device
+        module.to(device=target_device, dtype=target_dtype)
+        for p in module.parameters():
+            p.requires_grad_(False)
+        iv = Intervention(module, layers=layers, role_ids=role_ids)
+        iv.to(device=target_device)
+        self.interventions.append(iv)
+
+    def clear_interventions(self) -> None:
+        """Remove all registered interventions."""
+        self.interventions = nn.ModuleList()
+
+    def list_interventions(self) -> List[Intervention]:
+        return list(self.interventions)
+
+    def intervened_roles(self) -> Optional[Set[int]]:
+        """Union of role IDs targeted by any registered intervention.
+
+        Returns:
+          - ``None`` — at least one intervention matches every role (its
+            ``role_ids is None``). Every position is potentially
+            intervened.
+          - ``set()`` — no interventions registered.
+          - ``set[int]`` — union of intervened role IDs.
+        """
+        if len(self.interventions) == 0:
+            return set()
+        roles: Set[int] = set()
+        for iv in self.interventions:
+            if iv.role_ids is None:
+                return None
+            roles.update(iv.role_ids)
+        return roles
+
+    def _apply_interventions(
         self,
         hidden: torch.Tensor,
         *,
         layer_id: int,
-        input_ids: torch.Tensor,
         role_ids: Optional[torch.Tensor],
-        input_pos: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if not self.activation_hooks:
+        """Post-block dispatch. Runs each registered intervention whose
+        ``layers`` tuple includes ``layer_id``. Role filtering is
+        framework-side via a boolean mask on ``role_ids``; the user
+        module only computes a delta given ``hidden``.
+        """
+        if len(self.interventions) == 0:
             return hidden
-
-        ctx = HookContext(
-            layer_id=layer_id,
-            site="post_block",
-            input_ids=input_ids,
-            role_ids=role_ids,
-            input_pos=input_pos,
-            alpha=self.activation_hook_alpha,
-        )
-        expected_shape = hidden.shape
-        for hook in self.activation_hooks:
-            hidden = hook(hidden, ctx)
-            if hidden.shape != expected_shape:
-                raise ValueError(
-                    "activation hook must preserve hidden shape: "
-                    f"expected {tuple(expected_shape)}, got {tuple(hidden.shape)}"
-                )
+        for iv in self.interventions:
+            if layer_id not in iv.layers:
+                continue
+            delta = iv.module(hidden)
+            if iv.role_ids is None:
+                hidden = hidden + delta
+                continue
+            if role_ids is None:
+                # Intervention wants role filtering but the caller didn't
+                # supply role_ids. Skip — safer than applying unmasked.
+                continue
+            roles_t = iv._roles_t.to(device=role_ids.device)
+            mask = (role_ids.unsqueeze(-1) == roles_t.view(1, 1, -1)).any(dim=-1)
+            mask = mask.to(hidden.dtype).unsqueeze(-1)
+            hidden = hidden + mask * delta
         return hidden
 
-    def init_cache(
-        self, max_batch_size: int, device: str, max_cache_len: Optional[int] = None
-    ):
-        return KVArena(
-            self.params.n_layers,
-            max_batch_size,
-            max_cache_len or self.params.max_seq_len,
-            self.params.n_kv_heads,
-            self.params.head_dim,
-            device,
+    def _build_forward_context(self, cache: PagedKVPool, S: int):
+        """Build the paged attention context for one forward. Shared by
+        eager + the ``LLM._model_forward`` compile hoist.
+
+        Returns ``(pre_write_seqlens, paged_ctx)``. Subclasses override
+        to return a different ``*Context`` type (e.g. gpt-oss's
+        sink-aware variant); the driver treats both uniformly as
+        "pre-built attention handle".
+        """
+        from torchllms.models.paged_attention import (
+            build_paged_context_for_forward,
+        )
+        active_rids = cache.active_rollouts()
+        B = len(active_rids)
+        qlens = [S] * B
+        head_dim = self.params.head_dim
+        return build_paged_context_for_forward(
+            pool=cache, active_rids=active_rids, qlens=qlens,
+            n_heads=self.params.n_heads, n_kv_heads=self.params.n_kv_heads,
+            head_dim=head_dim,
+            sm_scale=head_dim ** -0.5,
             dtype=self.tok_embeddings.weight.dtype,
+            device=cache.device,
+            window_left=-1,
+        )
+
+    def init_cache(
+        self,
+        max_batch_size: int,
+        device: str,
+        max_cache_len: Optional[int] = None,
+        *,
+        page_size: int = 16,
+        kv_memory_gb: Optional[float] = None,
+    ) -> PagedKVPool:
+        """Allocate a PagedKVPool for this model.
+
+        Sizing rules:
+        - ``kv_memory_gb`` (explicit): pool holds ``floor(kv_memory_gb * 2^30
+          / bytes_per_page)`` pages. Use when you have a concrete VRAM
+          budget in mind.
+        - Default (``kv_memory_gb=None``): exactly the ``max_batch_size *
+          max_cache_len`` token footprint — matches the KVArena memory
+          envelope Phase 1 replaces. Pass ``kv_memory_gb`` explicitly if
+          you want headroom for radix prefix-cache sharing (Phase 2).
+
+        ``page_size=16`` is SGLang's default and flashinfer's documented
+        sweet spot. Increase for longer contexts where plan-side overhead
+        dominates.
+        """
+        max_seqlen = max_cache_len or self.params.max_seq_len
+        dtype = self.tok_embeddings.weight.dtype
+        element_size = torch.empty(0, dtype=dtype).element_size()
+        bytes_per_token_kv = (
+            self.params.n_layers * self.params.n_kv_heads
+            * self.params.head_dim * element_size * 2  # K + V
+        )
+        if kv_memory_gb is None:
+            total_bytes = max_batch_size * max_seqlen * bytes_per_token_kv
+        else:
+            total_bytes = int(kv_memory_gb * (1 << 30))
+        bytes_per_page = page_size * bytes_per_token_kv
+        total_pages = max(int(total_bytes // bytes_per_page), 1)
+        return PagedKVPool(
+            n_layers=self.params.n_layers,
+            total_pages=total_pages,
+            page_size=page_size,
+            n_kv_heads=self.params.n_kv_heads,
+            head_dim=self.params.head_dim,
+            max_bsz=max_batch_size,
+            device=device,
+            dtype=dtype,
         )
 
     def get_wd_params(self):
@@ -736,64 +882,65 @@ class Transformer(nn.Module):
         role_ids: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        cache: Optional[KVArena] = None,
+        cache: Optional[PagedKVPool] = None,
         logits_to_keep: Optional[int] = None,
+        paged_ctx: Optional["PagedContext"] = None,  # noqa: F821
     ):
         """
         Apply a single forward pass for training or inference (prefill + decoding).
 
         Args:
-            input_ids: Per-token input IDs to the model. (bsz, seqlen)
-            role_ids: Optional per-token role IDs to the model. (bsz, seqlen)
-            attn_mask: Optional attention mask specifying token indices to completely
-                ignore. 1 for tokens to attend, 0 for tokens to ignore. (bsz, seqlen)
-            input_pos: Optional per-token input positions to the model used for
-                positional embeddings. (bsz, seqlen) or (seqlen,)
-            cache: Optional decoding cache (past kv, position ids, etc).
-            logits_to_keep: Optional number of trailing sequence positions to
-                project to vocabulary logits. Generation only needs 1; training
-                and scoring should leave this unset to get full-sequence logits.
+            input_ids: (bsz, seqlen).
+            role_ids: optional (bsz, seqlen) tensor. Threaded to
+                registered interventions for role-filter mask construction
+                without mutation.
+            attn_mask: optional (bsz, seqlen). Used only in the no-cache
+                path (training / scoring) by SDPA / eager attention. The
+                paged-cache path does causal + (optionally) sliding-window
+                attention via flashinfer and ignores ``attn_mask``.
+            input_pos: optional (bsz, seqlen) or (seqlen,) position IDs
+                for RoPE. When not provided and a cache is present, it is
+                computed from the pool's per-rollout pre-write seqlens.
+            cache: optional :class:`PagedKVPool`. When provided, the
+                pool's active rollouts must match ``input_ids.shape[0]``.
+            logits_to_keep: keep only the last N positions of logits
+                (generation uses 1; training / scoring leaves this unset).
 
         Returns:
-            logits: The model's output logits. If logits_to_keep is set, only
-                that many trailing positions are returned.
-            cache: The updated cache, if provided.
+            (logits, cache) — cache is returned by convention; the pool is
+            mutated in place, the return is a reference.
 
-        In decoding steps during generation, `input_ids` and `role_ids` should
-        contain only the next time step. Batched generation may use `attn_mask` and
-        `input_pos` for the first prefill step. Decoding steps will automatically
-        extend both if not provided.
-
-        Attention-kernel routing happens inside ``Attention.forward``: decode
-        steps (``seqlen == 1`` with a cache and FA2 available) take the
-        fixed-shape ``flash_attn_with_kvcache`` path; everything else routes
-        through ``update_kv`` + dispatch by ``attention_impl``. KV-cache
-        budget tracking is the caller's responsibility.
-
-        Default behaviors:
-        - Missing `role_ids` skips role embeddings.
-        - Missing `attn_mask` attends to all tokens autoregressively.
-        - Missing `input_pos` applies positional embeddings starting from 0.
-        - Missing `cache` skips reading/writing past key/value vectors and role IDs.
+        Paged-cache protocol:
+            The pool's ``row_positions`` are read before ``extend_many``
+            to derive RoPE ``input_pos``. ``extend_many`` allocates pages
+            for the ``S`` new tokens per row. A single flashinfer wrapper
+            (prefill when ``S > 1``, decode when ``S == 1``) is planned
+            against the resulting block tables and threaded through each
+            layer as ``paged_ctx``. Hooks receive the active (current-
+            forward) ``role_ids`` unchanged.
         """
 
-        # RoPE assumes [0, 1, 2, ...] input_pos when not provided, offset by
-        # each row's current absolute position (derived from seen_tokens).
-        # seen_tokens is int32, so keep the arange int32 to avoid an upcast.
-        if input_pos is None and cache is not None:
-            input_pos = torch.arange(
-                input_ids.shape[1], dtype=torch.int32, device=input_ids.device,
-            )[None, :] + cache.row_positions[:, None]
-
-        context_input_pos = input_pos
-        if context_input_pos is None:
-            context_input_pos = torch.arange(
-                input_ids.shape[1], dtype=torch.int32, device=input_ids.device,
-            )[None, :].expand(input_ids.shape[0], -1)
-        elif context_input_pos.dim() == 1:
-            context_input_pos = context_input_pos[None, :].expand(
-                input_ids.shape[0], -1
-            )
+        # paged_ctx is pre-built by the driver for the decode-compile
+        # path (``LLM._model_forward``) — plan() has CPU-sync ops that
+        # fragment cudagraph partitions, so it must run OUTSIDE the
+        # compiled region. Eager callers without a pre-built ctx get
+        # the build done inline here via ``_build_forward_context``
+        # (overridden per-model: base Transformer builds a paged_ctx,
+        # GptOSSTransformer builds a sink_ctx — the driver treats both
+        # uniformly). input_pos must be supplied in both cases.
+        if cache is not None and paged_ctx is None:
+            B, S = input_ids.shape
+            active_rids = cache.active_rollouts()
+            if len(active_rids) != B:
+                raise RuntimeError(
+                    f"cache has {len(active_rids)} live rollouts but forward "
+                    f"received input_ids with batch={B}"
+                )
+            pre_write, paged_ctx = self._build_forward_context(cache, S)
+            if input_pos is None:
+                input_pos = torch.arange(
+                    S, dtype=torch.int32, device=input_ids.device,
+                )[None, :] + pre_write[:, None]
 
         h = self.tok_embeddings(input_ids)
 
@@ -801,18 +948,11 @@ class Transformer(nn.Module):
             h += self.role_embeddings(role_ids)
 
         active_role_ids = role_ids
-        if cache is not None:
-            role_ids = cache.update_role_ids(role_ids)
-            attn_mask = cache.update_attn_mask(attn_mask)
 
         for i, layer in enumerate(self.layers):
-            h = layer(h, role_ids, attn_mask, input_pos, cache)
-            h = self._apply_activation_hooks(
-                h,
-                layer_id=i,
-                input_ids=input_ids,
-                role_ids=active_role_ids,
-                input_pos=context_input_pos,
+            h = layer(h, role_ids, attn_mask, input_pos, cache, paged_ctx)
+            h = self._apply_interventions(
+                h, layer_id=i, role_ids=active_role_ids,
             )
 
         if logits_to_keep is not None:

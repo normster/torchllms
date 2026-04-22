@@ -1,24 +1,28 @@
-"""gpt-oss-20b torchllms validation via the flashinfer sink kernel.
+"""gpt-oss-20b torchllms correctness validation against SGLang.
 
-Mirrors ``validate_qwen3`` where applicable. Because gpt-oss uses MXFP4
-expert weights and flashinfer's sink kernel is only JIT-compiled for
-fp16/bf16, the fp32 bit-exact gate doesn't apply here — we test
-self-consistency + inter-call consistency instead:
+Parallel to ``validate_qwen3`` — correctness only, no throughput.
+Throughput benchmarking lives in
+``torchllms.inference.throughput_bench``.
+
+Because gpt-oss uses MXFP4 expert weights and flashinfer's sink kernel
+is only JIT-compiled for fp16/bf16, the fp32 bit-exact gate doesn't
+apply here — we test self-consistency + inter-call consistency instead:
 
 - **cache-consistency**: short + medium + long greedy decode with
   ``no_cache`` vs ``fresh_cache`` vs ``filled_cache`` (prefix-cache hit)
-  must produce identical tokens. Validates that flashinfer reads the
-  loaded prefix correctly, and that nothing about the "one page per
-  sequence" trick corrupts the KV write/read path.
-- **batched-vs-single**: ``LLM._generate_multiple(B=4)`` on a mix of
-  uniform and diverging-length prompts must match per-row
-  ``_generate_single`` calls token-for-token at temperature=0. This is
-  the primary win over the old triton kernel (which asserted
-  ``len(start_q) == 1`` and couldn't do diverging batched decode at all).
-- **layer-type parity**: alternating sliding / full attention layers both
-  work; gpt-oss lays them out as ``[sliding, full, sliding, full, ...]``
-  so all 24 layers contribute. The full end-to-end greedy decode running
-  at all exercises both paths. A loud dedicated test is unnecessary.
+  must produce identical tokens. Validates that the paged KV write/read
+  path is correct.
+- **batched-vs-single**: B=4 prefill on uniform + diverging-length
+  prompts matches per-row single calls at the true-last-prompt position
+  (top-1 match + logit drift < tolerance + top5 overlap).
+- **generation-vs-sglang** (``--phase sglang``): 3 prompts greedy
+  against SGLang as cross-engine ground truth. Two-stage lifecycle
+  (torchllms collects tokens → teardown → SGLang loads at
+  ``mem_fraction_static=0.70``) because gpt-oss MXFP4 weights + SGLang
+  KV pool don't co-exist on a 32 GB GPU.
+- **layer-type parity**: alternating sliding / full attention layers
+  both work end-to-end via flashinfer's sink wrapper (one full, one
+  sliding wrapper planned per forward).
 
 Run: ``python -m torchllms.inference.validate_gptoss``
 
@@ -140,11 +144,13 @@ def greedy_decode_batched(
     cur = torch.zeros((B, 1), dtype=torch.long, device=device)
     for b in range(B):
         cur[b, 0] = logits_all[b, int(true_lens[b].item()) - 1].argmax()
-    # Clip seen_tokens to each row's real prompt length so the decode
-    # step writes the sampled token's K/V at the correct per-row position
-    # (overwriting the padded slot if true_len < max_prompt_len). This is
-    # the critical step that enables diverging per-row cache lengths.
-    cache.set_seen_tokens_per_row(true_lens)
+    # Clip seqlen to each row's real prompt length so the decode step
+    # writes the sampled token's K/V at the correct per-row position
+    # (overwriting the padded slot if true_len < max_prompt_len). This
+    # is the critical step that enables diverging per-row cache lengths.
+    # For PagedKVPool this also releases the now-excess trailing pages.
+    active_rids = cache.active_rollouts()
+    cache.clamp_seqlens_per_row(active_rids, true_lens.tolist())
 
     out = [[int(cur[b, 0].item())] for b in range(B)]
     for step in range(1, n_tokens):
@@ -475,132 +481,10 @@ def run_generation_vs_sglang(
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: throughput (shared harness with Qwen3)
+# Throughput benchmarking lives in
+# ``torchllms.inference.throughput_bench`` — run
+# ``python -m torchllms.inference.throughput_bench --model gpt-oss``.
 # ---------------------------------------------------------------------------
-
-
-def run_throughput_gptoss(
-    model_path: str,
-    max_seq_len: int,
-) -> bool:
-    """Two-stage throughput bench for gpt-oss:
-      1. Load torchllms LLM, run W1/W2/W3, record results, tear down.
-      2. Load SGLang, run the same prompts, record results, tear down.
-      3. Print unified side-by-side table.
-
-    Sequential rather than interleaved because gpt-oss (MXFP4) weights
-    alone are ~10 GB and SGLang needs its full ``mem_fraction_static``
-    budget for the KV pool — both resident at once doesn't fit the
-    32 GB GPU, even at small context lengths.
-    """
-    try:
-        import sglang as sgl
-    except ImportError:
-        print("  SGLang not installed — skipping")
-        return True
-
-    from torchllms.inference.llm import LLM as TorchLLM
-    from torchllms.inference.prefix_cache import RadixKVCache
-    from torchllms.inference import throughput_bench
-    from torchllms.messages.tokenization_harmony import tokenize_harmony_conversation
-
-    sglang_path = model_path.rstrip("/")
-    if sglang_path.endswith("/original"):
-        sglang_path = sglang_path[: -len("/original")]
-
-    def tokenize_fn(conv, add_generation_prompt):
-        return tokenize_harmony_conversation(
-            conv, add_generation_prompt=add_generation_prompt,
-        )
-
-    # ------------ Stage 1: torchllms ------------
-    print("\n" + "=" * 72)
-    print("Stage 1: torchllms gpt-oss via flashinfer sink kernel")
-    print("=" * 72)
-    print(f"  Loading from {model_path} ...")
-    t0 = time.time()
-    llm = TorchLLM(
-        ckpt_paths=[model_path],
-        max_len=max_seq_len,
-        device="cuda:0",
-        model_kwargs={"max_seq_len": max_seq_len, "mxfp4": True},
-        eos_ids=STOP_TOKEN_IDS,
-    )
-    print(f"    torchllms loaded in {time.time() - t0:.1f}s")
-    prefix_cache = RadixKVCache(max_bytes=2 * 1024**3)
-
-    torchllms_results = throughput_bench.bench_engine(
-        llm, tokenize_fn, llm.tokenizer,
-        engine_label="torchllms",
-        kind="torchllms",
-        prefix_cache=prefix_cache,
-        stop_token_ids=STOP_TOKEN_IDS,
-        w3_max_new=80,
-    )
-    for w in (torchllms_results.w1, torchllms_results.w2):
-        print(f"  {w.label}: prompt={w.prompt_len}t  out={w.out_tokens}t  "
-              f"prefill={w.prefill_tps:.1f}tps  decode={w.decode_tps:.1f}tps")
-    print(f"  W3 total: {torchllms_results.w3_total_s:.2f}s across "
-          f"{len(torchllms_results.w3_turns)} turns")
-
-    # Tear down torchllms completely so SGLang can have the full GPU.
-    from torchllms.models import flashinfer_attention as _fa
-    _fa._WRAPPER_CACHE.clear()
-    del llm
-    del prefix_cache
-    import gc as _gc
-    _gc.collect()
-    torch.cuda.empty_cache()
-
-    # ------------ Stage 2: SGLang ------------
-    print("\n" + "=" * 72)
-    print("Stage 2: SGLang reference")
-    print("=" * 72)
-    free_gb = torch.cuda.mem_get_info()[0] / 1024**3
-    print(f"  free CUDA memory pre-load: {free_gb:.1f} GB")
-    print(f"  Loading SGLang from {sglang_path} (mem_fraction_static=0.70) ...")
-    t0 = time.time()
-    engine = sgl.Engine(
-        model_path=sglang_path,
-        dtype="bfloat16",
-        mem_fraction_static=0.70,
-        context_length=max_seq_len,
-        disable_cuda_graph=True,
-    )
-    print(f"    SGLang loaded in {time.time() - t0:.1f}s")
-
-    # Create a stub HF tokenizer for sglang-side decode of output tokens —
-    # gpt-oss's tiktoken works.
-    from torchllms.models.weights_gptoss import get_gptoss_tokenizer
-    tokenizer = get_gptoss_tokenizer()
-
-    try:
-        sglang_results = throughput_bench.bench_engine(
-            engine, tokenize_fn, tokenizer,
-            engine_label="sglang",
-            kind="sglang",
-            stop_token_ids=STOP_TOKEN_IDS,
-            w3_max_new=80,
-        )
-        for w in (sglang_results.w1, sglang_results.w2):
-            print(f"  {w.label}: prompt={w.prompt_len}t  out={w.out_tokens}t  "
-                  f"prefill={w.prefill_tps:.1f}tps  decode={w.decode_tps:.1f}tps")
-        print(f"  W3 total: {sglang_results.w3_total_s:.2f}s across "
-              f"{len(sglang_results.w3_turns)} turns")
-    finally:
-        sd = getattr(engine, "shutdown", None)
-        if sd is not None:
-            sd()
-        del engine
-        _gc.collect()
-        torch.cuda.empty_cache()
-
-    # ------------ Stage 3: unified table ------------
-    throughput_bench.print_combined_throughput(
-        torchllms_results, sglang_results, model_label="gpt-oss-20b",
-    )
-
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -609,12 +493,19 @@ def run_throughput_gptoss(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=(
+            "gpt-oss-20b torchllms correctness validation against SGLang. "
+            "Three phases: cache-consistency, batched-vs-single, "
+            "generation-vs-sglang. Throughput benchmarking lives in "
+            "``torchllms.inference.throughput_bench`` (run separately)."
+        ),
+    )
     ap.add_argument("--model-path", default=MODEL_PATH)
     ap.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     ap.add_argument(
         "--phase",
-        choices=["all", "cache", "batched", "sglang", "throughput"],
+        choices=["all", "cache", "batched", "sglang"],
         default="all",
     )
     ap.add_argument(
@@ -624,16 +515,6 @@ def main() -> int:
     args = ap.parse_args()
 
     torch.set_grad_enabled(False)
-
-    # The throughput phase manages its own torchllms + SGLang lifecycle
-    # (both models resident simultaneously), so it runs standalone and
-    # skips the rest of the validator. ``--phase all`` does NOT include
-    # throughput since the sglang-correctness phase tears down torchllms,
-    # which throughput needs resident.
-    if args.phase == "throughput":
-        ok = run_throughput_gptoss(args.model_path, args.max_seq_len)
-        print(f"\nVALIDATE-GPTOSS: {'PASS' if ok else 'FAIL'}")
-        return 0 if ok else 1
 
     print(f"Loading gpt-oss from {args.model_path} (max_seq_len={args.max_seq_len}) ...")
     t0 = time.time()
@@ -657,6 +538,7 @@ def main() -> int:
         # isolated --phase batched run.
         from torchllms.models import flashinfer_attention as _fa
         _fa._WRAPPER_CACHE.clear()
+        _fa._DECODE_WRAPPER_CACHE.clear()
         torch.cuda.empty_cache()
 
     if args.phase in ("all", "batched"):
@@ -685,6 +567,7 @@ def main() -> int:
         print("  Tearing down torchllms before SGLang load ...")
         from torchllms.models import flashinfer_attention as _fa
         _fa._WRAPPER_CACHE.clear()
+        _fa._DECODE_WRAPPER_CACHE.clear()
         del model
         import gc as _gc
         _gc.collect()

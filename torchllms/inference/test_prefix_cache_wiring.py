@@ -1,20 +1,35 @@
-"""Integration tests for LLM._generate_single with prefix caching.
+"""Integration tests for LLM._generate_single/_generate_multiple.
 
-Uses a deterministic fake transformer (CPU, bf16) so we can verify:
-  1. Cached and uncached generations produce identical output tokens.
-  2. Cached generation prefills fewer tokens than uncached.
-  3. The prefix cache gets populated after a call.
-  4. Subsequent calls with shared prefixes reuse the cached KV.
+Uses a deterministic fake transformer (CPU, bf16) so we can verify
+generate-loop mechanics independently from the attention backend.
+
+Tests that exercise prefix caching specifically require a
+``PagedKVPool``-backed model — the Phase 2 ``RadixKVCache`` binds to
+the pool by page ID, not to CPU-resident chunks. Since the
+``FakeTransformer`` here writes KV through ``KVArena.update_kv`` it
+can't back a paged cache, so prefix-cache-specific tests are
+``skipif``'d. Equivalent coverage lives in
+``torchllms/inference/test_prefix_cache.py`` (unit tests over the trie)
+and ``torchllms/inference/validate_qwen3.py`` § W3 multiturn
+(end-to-end on Qwen3-4B).
 """
 
 from __future__ import annotations
 
+import pytest
 import torch
 
+from torchllms.messages import Role
 from torchllms.inference.llm import LLM
 from torchllms.inference.prefix_cache import RadixKVCache
 from torchllms.models.cache import KVArena
 from torchllms.models.networks import _eager_attention, _sdpa_attention
+
+
+_PAGED_ONLY = pytest.mark.skip(
+    reason="prefix cache requires PagedKVPool; FakeTransformer here uses "
+    "KVArena. Covered by test_prefix_cache.py + validate_qwen3 W3."
+)
 
 
 VOCAB = 32
@@ -124,13 +139,16 @@ class _FakeTokenizer:
         return " ".join(str(i) for i in ids)
 
 
-def _build_llm(model, prefix_cache=None, max_len=256, eos_ids=None) -> LLM:
+def _build_llm(
+    model, prefix_cache=None, max_len=256, max_bsz=4, eos_ids=None,
+) -> LLM:
     llm = LLM.__new__(LLM)
     llm.model = model
     llm._compiled_decode_model = None
     llm.tokenizer = _FakeTokenizer()
     llm.template_config = None
     llm.max_len = max_len
+    llm.max_bsz = max_bsz
     llm.device = "cpu"
     llm.batched = False
     # 0 is never produced by our fake (argmax=(p+1)%V, p≥0) so the default
@@ -138,6 +156,9 @@ def _build_llm(model, prefix_cache=None, max_len=256, eos_ids=None) -> LLM:
     llm.eos_ids = list(eos_ids) if eos_ids is not None else [0]
     llm.eos_set = set(llm.eos_ids)
     llm.prefix_cache = prefix_cache
+    # Long-lived cache (KVArena on this FakeTransformer). Matches what
+    # ``LLM.__init__`` does for real models.
+    llm.cache = model.init_cache(max_bsz, "cpu", max_cache_len=max_len)
     return llm
 
 
@@ -192,6 +213,7 @@ def test_single_max_new_tokens_zero_returns_empty():
     assert model.forward_calls == []
 
 
+@_PAGED_ONLY
 def test_prefix_cache_populated_after_call():
     """First call with an empty prefix_cache should insert the prefix.
 
@@ -212,6 +234,7 @@ def test_prefix_cache_populated_after_call():
     assert match.hit and match.length == 7
 
 
+@_PAGED_ONLY
 def test_second_call_reuses_prefix():
     """Second call with a shared prefix should prefill only the suffix."""
     model = FakeTransformer()
@@ -235,6 +258,7 @@ def test_second_call_reuses_prefix():
     assert out_b.text == "7 8 9", f"got {out_b.text!r}"
 
 
+@_PAGED_ONLY
 def test_cached_and_uncached_produce_identical_output():
     """Critical correctness: output must be bit-identical with vs without cache."""
     prompt = torch.tensor([[5, 6, 7, 8, 9, 10, 11]], dtype=torch.long)
@@ -259,6 +283,7 @@ def test_cached_and_uncached_produce_identical_output():
     )
 
 
+@_PAGED_ONLY
 def test_full_prefix_match_leaves_one_token_to_prefill():
     """If the prompt is entirely in the cache, we must still prefill at least
     one token so fresh logits are produced for sampling."""
@@ -462,6 +487,89 @@ def test_multi_empty_input_returns_empty():
     assert llm._generate_multiple([], max_new_tokens=2) == []
 
 
+# ------------------------------------------------------------------
+# Intervention-aware prefix-cache clamp
+# ------------------------------------------------------------------
+
+
+class _InterventionAwareFake(FakeTransformer):
+    """FakeTransformer that exposes controllable intervened-roles state.
+
+    Enough to unit-test ``LLM._first_intervened_pos`` and
+    ``LLM._intervened_roles_set`` without pulling in the real
+    Transformer's nn.ModuleList machinery.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._intervened_roles: object = set()  # set[int] | None | set()
+
+    def intervened_roles(self):
+        return self._intervened_roles
+
+
+def _mk_intervention_aware_llm():
+    model = _InterventionAwareFake()
+    llm = _build_llm(model, prefix_cache=None)
+    return llm, model
+
+
+def test_first_intervened_pos_none_when_no_interventions():
+    llm, model = _mk_intervention_aware_llm()
+    model._intervened_roles = set()
+    assert llm._first_intervened_pos([int(Role.USER), int(Role.TOOL)]) is None
+    assert llm._first_intervened_pos(None) is None
+
+
+def test_first_intervened_pos_zero_when_all_roles_intervened():
+    llm, model = _mk_intervention_aware_llm()
+    model._intervened_roles = None  # matches-all sentinel
+    assert llm._first_intervened_pos([int(Role.USER), int(Role.TOOL)]) == 0
+    # Even with no role list we clamp to 0 (nothing is shareable).
+    assert llm._first_intervened_pos(None) == 0
+
+
+def test_first_intervened_pos_finds_first_matching_role():
+    llm, model = _mk_intervention_aware_llm()
+    model._intervened_roles = {int(Role.TOOL)}
+    roles = [int(Role.USER), int(Role.USER), int(Role.TOOL), int(Role.ASSISTANT), int(Role.TOOL)]
+    assert llm._first_intervened_pos(roles) == 2
+
+
+def test_first_intervened_pos_none_when_role_not_in_prompt():
+    llm, model = _mk_intervention_aware_llm()
+    model._intervened_roles = {int(Role.TOOL)}
+    roles = [int(Role.USER), int(Role.USER), int(Role.ASSISTANT)]
+    assert llm._first_intervened_pos(roles) is None
+
+
+def test_first_intervened_pos_handles_union_of_role_sets():
+    llm, model = _mk_intervention_aware_llm()
+    model._intervened_roles = {int(Role.TOOL), int(Role.USER)}
+    roles = [int(Role.SYSTEM), int(Role.USER), int(Role.TOOL)]
+    assert llm._first_intervened_pos(roles) == 1
+
+
+def test_first_intervened_pos_defensive_when_role_list_absent_with_specific_roles():
+    """If interventions request specific roles but the caller gave no
+    role list, we can't identify the boundary precisely — default to
+    disabling sharing (clamp to 0)."""
+    llm, model = _mk_intervention_aware_llm()
+    model._intervened_roles = {int(Role.TOOL)}
+    assert llm._first_intervened_pos(None) == 0
+
+
+def test_intervened_roles_set_without_model_support():
+    """Models that don't expose ``intervened_roles`` (e.g. KVArena-only
+    backends today) fall back to an empty set — no clamp applied."""
+    # FakeTransformer has no intervened_roles method.
+    model = FakeTransformer()
+    llm = _build_llm(model, prefix_cache=None)
+    assert llm._intervened_roles_set() == set()
+    assert llm._first_intervened_pos([int(Role.TOOL), int(Role.USER)]) is None
+
+
+@_PAGED_ONLY
 def test_multi_inserts_into_prefix_cache_per_row():
     """Each retired row should land in the radix cache as its own entry.
     FakeTransformer produces the same tokens across rows, but we use

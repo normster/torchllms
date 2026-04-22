@@ -303,6 +303,13 @@ class KVArena:
     def active_rollouts(self) -> List[RolloutId]:
         return list(self.slot_to_rollout)
 
+    def seqlen(self, rid: RolloutId) -> int:
+        """Current number of valid KV tokens for this rollout. Mirrors
+        :meth:`torchllms.models.paged_kv.PagedKVPool.seqlen` so callers
+        can treat both cache types uniformly."""
+        slot = self.rollout_to_slot[rid]
+        return int(self.seen_tokens[0, slot].item())
+
     # ---------------------------- Retirement --------------------------- #
 
     def retire(self, rid: RolloutId) -> KVChunk:

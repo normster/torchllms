@@ -1,6 +1,6 @@
-"""Qwen3-4B torchllms vs SGLang: correctness + throughput validation.
+"""Qwen3-4B torchllms correctness validation against SGLang.
 
-Runs five phases end-to-end (no flags):
+Runs four phases end-to-end (no flags):
 
   cache-correctness      — cache preserves correctness; batched path
                            preserves correctness. fp32 bit-exact gate;
@@ -15,23 +15,20 @@ Runs five phases end-to-end (no flags):
                            similarity, and decoded heads. Not a hard
                            gate: kernels differ, bf16 argmax can flip on
                            close candidates.
-  throughput             — workload-shape-broken-out prefill/decode tps,
-                           torchllms vs torchllms+noop-hook vs SGLang.
-                             W1. short/short  — baseline roundtrip
-                             W2. short/long   — decode-heavy
-                             W3. multiturn long/short (agentic) —
-                                 cache engaged across turns
   decode-compile         — decode-only torch.compile smoke: eager vs
-                           compiled tokens match, warmup + steady-state
-                           wallclock reported. Opt-in speed experiment,
-                           not the default speed path.
+                           compiled tokens match within bf16 drift
+                           tolerance (first-diverge >= 8). Correctness
+                           check; throughput measurement lives separately.
+
+Throughput benchmarking is a separate concern — run
+``python -m torchllms.inference.throughput_bench --model qwen3``.
 
 Everything runs at bf16 (production path) except the cache-correctness
-fp32 gate. flash-attn is required for torchllms to hit the FA2 paths.
+fp32 gate.
 
 Usage:
     python -m torchllms.inference.validate_qwen3
-    python -m torchllms.inference.validate_qwen3 --no-sglang  # skip SGLang phases
+    python -m torchllms.inference.validate_qwen3 --no-sglang
 
 Model path is controlled by the ``TORCHLLMS_QWEN3_PATH`` environment
 variable (default ``/root/qwen3-4b``). The HF checkpoint directory and
@@ -62,7 +59,7 @@ from torchllms.messages.tokenization import (
     TemplateConfig,
     tokenize_conversation,
 )
-from torchllms.models import AdditiveVectorIntervention
+from torchllms.models import AddVec
 
 
 HF_PATH = os.environ.get("TORCHLLMS_QWEN3_PATH", "/root/qwen3-4b")
@@ -646,9 +643,9 @@ def run_activation_correctness(
     tokenizer,
     config: TemplateConfig,
 ) -> bool:
-    """Check that an installed no-op activation hook is exactly a no-op."""
+    """Check that an installed no-op intervention is exactly a no-op."""
     print("\n" + "=" * 72)
-    print("ACTIVATION-CORRECTNESS (no-op hook is identity)")
+    print("ACTIVATION-CORRECTNESS (no-op intervention is identity)")
     print("=" * 72)
 
     conv = [
@@ -660,24 +657,28 @@ def run_activation_correctness(
     )
 
     llm.prefix_cache = None
-    llm.clear_activation_hooks()
+    llm.clear_interventions()
     no_hook_out, no_hook_logits = _gen_with_logits(llm, ids, roles, 32, tokenizer)
 
-    calls: list[tuple[int, tuple[int, ...]]] = []
+    class _NoopCounter(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
 
-    def noop_intervention(hidden, ctx):
-        calls.append((ctx.layer_id, tuple(ctx.input_ids.shape)))
-        return hidden
+        def forward(self, hidden):
+            self.calls += 1
+            return torch.zeros_like(hidden)
 
+    noop = _NoopCounter()
     llm.prefix_cache = None
-    llm.set_activation_hooks(noop_intervention)
+    llm.register_intervention(noop, layers=list(range(llm.model.params.n_layers)))
     hooked_out, hooked_logits = _gen_with_logits(llm, ids, roles, 32, tokenizer)
-    llm.clear_activation_hooks()
+    llm.clear_interventions()
 
     logits_ok, dv, max_diff = _logits_equal(no_hook_logits, hooked_logits, atol=0.0)
     tokens_ok = no_hook_out.token_ids == hooked_out.token_ids
-    calls_ok = len(calls) > 0
-    print(f"  hook calls: {len(calls)}")
+    calls_ok = noop.calls > 0
+    print(f"  intervention calls: {noop.calls}")
     print(f"  logits: {'PASS' if logits_ok else f'FAIL dv@{dv} max_diff={max_diff:.2e}'}")
     print(f"  tokens_match={tokens_ok}")
     return logits_ok and tokens_ok and calls_ok
@@ -688,7 +689,7 @@ def run_decode_compile(
     tokenizer,
     config: TemplateConfig,
     *,
-    compile_mode: str = "reduce-overhead",
+    compile_mode: str = "default",
 ) -> bool:
     """Decode-only torch.compile smoke: eager vs compiled tokens match."""
     print("\n" + "=" * 72)
@@ -711,7 +712,7 @@ def run_decode_compile(
         return out, wall
 
     llm.prefix_cache = None
-    llm.clear_activation_hooks()
+    llm.clear_interventions()
     llm.disable_decode_compile()
     eager, eager_wall = run_once("eager")
 
@@ -740,13 +741,13 @@ def run_decode_compile(
         device=llm.device,
         dtype=llm.model.tok_embeddings.weight.dtype,
     )
-    hook = AdditiveVectorIntervention(zero_vec, layers=19, scale=1.0)
-    llm.set_activation_hooks(hook)
+    hook = AddVec(zero_vec)
+    llm.register_intervention(hook, layers=[19])
     llm.enable_decode_compile(mode=compile_mode)
     hooked_first, hooked_first_wall = run_once("compiled+zero first")
     hooked_second, hooked_second_wall = run_once("compiled+zero second")
     llm.disable_decode_compile()
-    llm.clear_activation_hooks()
+    llm.clear_interventions()
 
     hook_div = _first_diverge(eager.token_ids, hooked_second.token_ids)
     hook_ok = hook_div >= 8
@@ -939,138 +940,6 @@ def _build_w3_history_to_turn(n: int) -> list[dict]:
     return msgs
 
 
-def _make_counting_noop_hook():
-    calls = 0
-
-    def noop_intervention(hidden, ctx):
-        nonlocal calls
-        calls += 1
-        return hidden
-
-    def get_calls() -> int:
-        return calls
-
-    return noop_intervention, get_calls
-
-
-def _split_torchllms_with_optional_noop(
-    llm,
-    ids,
-    roles,
-    max_new,
-    tokenizer,
-    *,
-    use_noop_hook: bool,
-):
-    noop_hook, get_calls = _make_counting_noop_hook()
-    llm.prefix_cache = None
-    llm.clear_activation_hooks()
-    if use_noop_hook:
-        llm.set_activation_hooks(noop_hook)
-    try:
-        out, pre, dec = _split_prefill_decode(
-            lambda n: _gen_torchllms_once(llm, ids, roles, n, tokenizer), max_new,
-        )
-    finally:
-        llm.clear_activation_hooks()
-    return out, pre, dec, get_calls()
-
-
-def _gen_torchllms_once_with_optional_noop(
-    llm,
-    ids,
-    roles,
-    max_new,
-    tokenizer,
-    *,
-    prefix_cache,
-    use_noop_hook: bool,
-):
-    noop_hook, get_calls = _make_counting_noop_hook()
-    llm.prefix_cache = prefix_cache
-    llm.clear_activation_hooks()
-    if use_noop_hook:
-        llm.set_activation_hooks(noop_hook)
-    try:
-        out, wall = _gen_torchllms_once(llm, ids, roles, max_new, tokenizer)
-    finally:
-        llm.clear_activation_hooks()
-    return out, wall, get_calls()
-
-
-def _bench_single(llm, engine, conv, max_new, tokenizer, config, label: str):
-    ids, roles = tokenize_conversation(
-        conv, tokenizer, config, add_generation_prompt=True,
-    )
-
-    t_out, t_pre, t_dec, _ = _split_torchllms_with_optional_noop(
-        llm, ids, roles, max_new, tokenizer, use_noop_hook=False,
-    )
-    tn_out, tn_pre, tn_dec, noop_calls = _split_torchllms_with_optional_noop(
-        llm, ids, roles, max_new, tokenizer, use_noop_hook=True,
-    )
-    s_out, s_pre, s_dec = _split_prefill_decode(
-        lambda n: _gen_sglang_once(engine, ids, n, tokenizer), max_new,
-    )
-
-    t_pre_tps = len(ids) / t_pre if t_pre > 0 else 0.0
-    s_pre_tps = len(ids) / s_pre if s_pre > 0 else 0.0
-    t_dec_tokens = max(len(t_out.token_ids) - 1, 0)
-    tn_pre_tps = len(ids) / tn_pre if tn_pre > 0 else 0.0
-    tn_dec_tokens = max(len(tn_out.token_ids) - 1, 0)
-    tn_dec_tps = tn_dec_tokens / tn_dec if tn_dec > 0 else 0.0
-    s_dec_tokens = max(len(s_out.token_ids) - 1, 0)
-    t_dec_tps = t_dec_tokens / t_dec if t_dec > 0 else 0.0
-    s_dec_tps = s_dec_tokens / s_dec if s_dec > 0 else 0.0
-
-    print(f"\n  [{label}] prompt={len(ids)}t  "
-          f"torchllms_out={len(t_out.token_ids)}t  "
-          f"noop_out={len(tn_out.token_ids)}t  "
-          f"sglang_out={len(s_out.token_ids)}t")
-    print(f"    {'engine':<10s}  {'prefill_tps':>11s}  {'decode_tps':>11s}  {'total_s':>8s}")
-    print(f"    {'torchllms':<10s}  {t_pre_tps:>11.1f}  {t_dec_tps:>11.1f}  {t_pre + t_dec:>8.2f}")
-    print(f"    {'torch+noop':<10s}  {tn_pre_tps:>11.1f}  {tn_dec_tps:>11.1f}  {tn_pre + tn_dec:>8.2f}")
-    print(f"    {'sglang':<10s}  {s_pre_tps:>11.1f}  {s_dec_tps:>11.1f}  {s_pre + s_dec:>8.2f}")
-    ratio_prefill = s_pre_tps / t_pre_tps if t_pre_tps > 0 else 0.0
-    ratio_decode = s_dec_tps / t_dec_tps if t_dec_tps > 0 else 0.0
-    print(f"    sglang/torchllms speedup: prefill={ratio_prefill:.2f}x  decode={ratio_decode:.2f}x")
-    noop_pre_slowdown = tn_pre / t_pre if t_pre > 0 else 0.0
-    noop_dec_slowdown = tn_dec / t_dec if t_dec > 0 else 0.0
-    noop_total_slowdown = (tn_pre + tn_dec) / (t_pre + t_dec) if (t_pre + t_dec) > 0 else 0.0
-    print(
-        f"    noop/torchllms time: prefill={noop_pre_slowdown:.2f}x  "
-        f"decode={noop_dec_slowdown:.2f}x  total={noop_total_slowdown:.2f}x  "
-        f"hook_calls={noop_calls}"
-    )
-
-
-def run_throughput(llm, engine, prefix_cache, tokenizer, config, *, compile_decode: bool = False):
-    """Qwen3 wrapper around the shared throughput bench.
-
-    W1/W2/W3 workload definitions live in
-    ``torchllms.inference.throughput_bench``; this just wires in Qwen3's
-    template-config-based tokenization and Qwen3 stop tokens so gpt-oss
-    can use the same harness via Harmony tokenization.
-    """
-    from torchllms.inference import throughput_bench
-
-    def tokenize_fn(conv, add_generation_prompt):
-        return tokenize_conversation(
-            conv, tokenizer, config, add_generation_prompt=add_generation_prompt,
-        )
-
-    throughput_bench.run_throughput(
-        llm, engine, tokenize_fn, tokenizer,
-        prefix_cache=prefix_cache,
-        model_label=f"Qwen3-4B ({PRECISION})",
-        stop_token_ids=list(STOP_TOKEN_IDS),
-        run_noop_hook=not compile_decode,  # noop hooks + compile = extra warmup churn; skip
-        trials=TRIALS, warmup=WARMUP,
-        compile_decode=compile_decode,
-    )
-    return  # main() doesn't use the return value.
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1079,15 +948,16 @@ def run_throughput(llm, engine, prefix_cache, tokenizer, config, *, compile_deco
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Qwen3-4B torchllms validation harness. Runs five phases: "
+            "Qwen3-4B torchllms correctness validation. Runs four phases: "
             "cache-correctness, activation-correctness, generation-correctness, "
-            "throughput, decode-compile."
+            "decode-compile. Throughput benchmarking lives in "
+            "``torchllms.inference.throughput_bench`` (run separately)."
         ),
     )
     parser.add_argument(
         "--no-sglang",
         action="store_true",
-        help="Skip SGLang-dependent phases (generation-correctness, throughput).",
+        help="Skip the generation-correctness phase (which requires SGLang).",
     )
     return parser.parse_args()
 
@@ -1106,7 +976,6 @@ def main() -> int:
         device="cuda:0",
         precision=PRECISION,
     )
-    prefix_cache = RadixKVCache(max_bytes=4 * 1024**3)
 
     engine = None
     if not args.no_sglang:
@@ -1125,6 +994,13 @@ def main() -> int:
             )
     else:
         print("(SGLang skipped — generation-correctness and throughput phases will be skipped)")
+
+    # Phase 2 RadixKVCache binds to the PagedKVPool. Materialize the pool
+    # here (post-SGLang-load so SGLang observed the right free-VRAM
+    # budget) and construct the radix; the LLM's generate paths will
+    # reuse this pool.
+    llm._ensure_cache()
+    prefix_cache = llm.make_prefix_cache()
 
     tokenizer = AutoTokenizer.from_pretrained(HF_PATH, trust_remote_code=True)
     config = _load_config()
@@ -1147,15 +1023,13 @@ def main() -> int:
             print("\nactivation-correctness: FAILED — no-op hook changed outputs or was not called.")
             return 1
 
-        # generation-correctness + throughput require SGLang
+        # generation-correctness requires SGLang.
         if engine is not None:
             gc.collect(); torch.cuda.empty_cache()
             run_generation_correctness(llm, engine, tokenizer, config)
             gc.collect(); torch.cuda.empty_cache()
-            run_throughput(llm, engine, prefix_cache, tokenizer, config)
-            gc.collect(); torch.cuda.empty_cache()
 
-        # decode-compile: opt-in torch.compile smoke, runs last so a compile
+        # decode-compile: torch.compile smoke, runs last so a compile
         # failure doesn't block the phases above.
         decode_compile_ok = run_decode_compile(llm, tokenizer, config)
         if not decode_compile_ok:

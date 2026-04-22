@@ -98,11 +98,14 @@ class LLM:
         template_config: Optional[str] = None,
         eos_ids: Optional[List[int]] = None,
         max_len: int = 4096,
+        max_bsz: int = 4,
         device: str = "cuda",
         precision: str = "bfloat16",
         model_kwargs: Optional[Dict[str, Any]] = None,
         batched: bool = False,
         prefix_cache: Optional[RadixKVCache] = None,
+        page_size: int = 16,
+        kv_memory_gb: Optional[float] = None,
     ):
         # Detect gpt-oss checkpoints (HF safetensors + config.json with
         # architectures=["GptOssForCausalLM"]) and route to setup_gptoss,
@@ -135,14 +138,44 @@ class LLM:
         model.eval()
 
         self.model = model
-        # Decode-only torch.compile is kept as an opt-in experiment. Whole-
-        # model compile has never been the speed path and is not wired.
+        # torch.compile is opt-in on each side. Decode and prefill have
+        # different trade-offs:
+        #   - decode: fixed shape (S==1, B bounded), benefits from
+        #     cudagraph capture (``mode="reduce-overhead"``). ~4× eager.
+        #   - prefill: variable S, compiled with ``dynamic=True`` so one
+        #     compile covers all shapes. Inductor-only (no cudagraph) —
+        #     the fused QKV + epilogue-RMSNorm wins still apply. ~2×
+        #     eager on medium/long prompts.
+        # Callers opt in via ``enable_decode_compile`` / ``enable_prefill_compile``.
         self._compiled_decode_model = None
+        self._compiled_prefill_model = None
         self.tokenizer = tokenizer
         self.template_config = template_config
         self.max_len = max_len
+        self.max_bsz = max_bsz
         self.device = device
         self.prefix_cache = prefix_cache
+
+        # Long-lived cache owned by the LLM. For the base Transformer this
+        # is a PagedKVPool; for gpt-oss it's a KVArena (migration scheduled
+        # for Phase 4). Either way, generate calls claim/retire against this
+        # single instance rather than allocating per-call — eliminates the
+        # per-call arena alloc overhead and keeps the decode-compile path's
+        # tensor shapes stable across calls.
+        #
+        # Allocation is **lazy**: the cache is built on first ``_generate_*``
+        # call. This lets a caller that co-locates torchllms with another
+        # engine (e.g. SGLang for cross-engine validation) load both weight
+        # blobs before either claims its KV budget from the remaining free
+        # VRAM. Once built, the cache persists for the LLM's lifetime.
+        self._cache_build_kwargs = {
+            "max_batch_size": max_bsz,
+            "device": device,
+            "max_cache_len": max_len,
+            "page_size": page_size,
+            "kv_memory_gb": kv_memory_gb,
+        }
+        self.cache = None
 
         self.batched = batched
         if self.batched and self.model.params.attention_impl in [
@@ -174,19 +207,35 @@ class LLM:
     ) -> None:
         """Compile only decode forwards.
 
-        Prefill remains eager to avoid variable prompt shapes. Decode routes
-        through ``Attention``'s internal ``seqlen == 1`` fixed-shape path
-        automatically, so the compiled body keeps fixed cache tensor shapes.
-        Opt-in: not the default speed path. Use with the ``decode-compile``
-        validator phase to verify correctness and measure gain.
+        Prefill remains eager to avoid variable prompt shapes. Decode
+        routes through the ``torchllms::paged_attn_run`` custom op
+        (which makes flashinfer's ``wrapper.run`` opaque to Dynamo).
+        The flashinfer decode wrapper is constructed with
+        ``use_cuda_graph=True`` and bound to ``PagedKVPool``'s
+        pre-allocated ``_kv_indptr_buf`` / ``_kv_indices_buf`` /
+        ``_kv_last_page_len_buf``, all ``mark_static_address``'d —
+        plan() writes content into those stable buffers so cudagraph
+        replay sees consistent pointers.
 
-        Bumps ``torch._dynamo.config.cache_size_limit`` to ``recompile_limit``
-        if currently lower. The default 8 is not enough headroom for a 36-
-        layer transformer where each ``TransformerBlock`` has its own
-        ``self.layer_id`` integer attribute triggering a separate Dynamo
-        specialization; varying prompt shapes across calls compound the
-        effect. 128 is comfortable for typical use; raise further if the
-        compile phase logs ``cache_size_limit reached`` warnings.
+        ``mode`` defaults to ``"reduce-overhead"`` (Inductor + CUDA
+        graph capture). Gives ~4× eager on Qwen3-4B W3 by amortizing
+        kernel launch overhead across the decode forward.
+
+        ``"default"`` (Inductor only, no cudagraph) is also supported
+        — useful when cudagraph capture fails on a model variant we
+        haven't wired through (e.g. gpt-oss where
+        ``triton_kernels.matmul_ogs`` / ``routing`` call ``.data_ptr()``
+        during fake-tensor shape inference). Falls back to ~2× eager
+        from Inductor kernel fusion alone.
+
+        Bumps ``torch._dynamo.config.cache_size_limit`` to
+        ``recompile_limit`` if currently lower. The default 8 is not
+        enough headroom for a 36-layer transformer where each
+        ``TransformerBlock`` has its own ``self.layer_id`` integer
+        attribute triggering a separate Dynamo specialization; varying
+        prompt shapes across calls compound the effect. 128 is
+        comfortable for typical use; raise further if the compile phase
+        logs ``cache_size_limit reached`` warnings.
         """
         import torch._dynamo as _dynamo
         if _dynamo.config.cache_size_limit < recompile_limit:
@@ -196,31 +245,198 @@ class LLM:
     def disable_decode_compile(self) -> None:
         self._compiled_decode_model = None
 
+    def enable_prefill_compile(
+        self,
+        *,
+        mode: str = "default",
+        recompile_limit: int = 128,
+    ) -> None:
+        """Compile prefill forwards with Inductor-only dynamic shapes.
+
+        One compile covers all prompt lengths via Dynamo's symbolic-shape
+        tracing (``dynamic=True``). Inductor fuses QKV/FFN linears +
+        RMSNorm + RoPE that otherwise launch as separate kernels on the
+        eager path — typical 1.5–2× prefill speedup on medium/long
+        prompts, more on short prompts where launch overhead dominates.
+
+        ``mode`` defaults to ``"default"`` (Inductor kernel fusion,
+        no cudagraph capture). Prefill is intentionally NOT captured
+        in a cudagraph: flashinfer's ``use_cuda_graph=True`` prefill
+        contract pins batch size + total-new-tokens at the first plan()
+        call and rejects larger subsequent calls — incompatible with
+        variable prompt lengths. Bucketed-cudagraph prefill is a
+        deferred optimization (see docs/note_prefill_compile_plan.md
+        § P1.2).
+
+        Like :meth:`enable_decode_compile`, this does NOT automatically
+        invalidate when interventions change — callers must reinstall
+        after ``register_intervention`` / ``clear_interventions``.
+        """
+        import torch._dynamo as _dynamo
+        if _dynamo.config.cache_size_limit < recompile_limit:
+            _dynamo.config.cache_size_limit = recompile_limit
+        self._compiled_prefill_model = torch.compile(
+            self.model, mode=mode, dynamic=True,
+        )
+
+    def disable_prefill_compile(self) -> None:
+        self._compiled_prefill_model = None
+
+    def _ensure_cache(self):
+        """Lazily allocate the long-lived KV cache on first generate call."""
+        if self.cache is None:
+            self.cache = self.model.init_cache(**self._cache_build_kwargs)
+        return self.cache
+
+    def make_prefix_cache(self) -> RadixKVCache:
+        """Construct a fresh ``RadixKVCache`` bound to this LLM's
+        paged pool. Triggers lazy pool allocation. Only supported on
+        the base Transformer path (PagedKVPool); gpt-oss / olmo stay
+        on KVArena during Phase 1/2 and don't support prefix caching
+        until Phase 4.
+        """
+        self._ensure_cache()
+        from torchllms.models.paged_kv import PagedKVPool
+        if not isinstance(self.cache, PagedKVPool):
+            raise RuntimeError(
+                "prefix cache requires PagedKVPool; this LLM wraps a "
+                f"{type(self.cache).__name__} (gpt-oss / olmo migrate in Phase 4)"
+            )
+        return RadixKVCache(self.cache)
+
+    def enable_prefix_cache(self) -> RadixKVCache:
+        """Convenience: ``self.prefix_cache = self.make_prefix_cache()``.
+        Returns the new cache so callers can capture it for direct API
+        calls (``.clear()``, introspection)."""
+        self.prefix_cache = self.make_prefix_cache()
+        return self.prefix_cache
+
     def _model_forward(self, **kwargs):
-        # Decode forwards (qlen == 1 with a cache) can route through the
-        # compiled model when enabled; everything else goes through the
-        # eager model.
-        if self._compiled_decode_model is not None:
-            input_ids = kwargs.get("input_ids")
-            cache = kwargs.get("cache")
-            if (
-                input_ids is not None
-                and input_ids.shape[1] == 1
-                and cache is not None
-            ):
-                return self._compiled_decode_model(**kwargs)
+        # Routes a forward through the compiled decode model, the
+        # compiled prefill model, or eager, based on qlen + cache type.
+        #
+        # For BOTH compiled paths on PagedKVPool, build the paged
+        # attention context (``wrapper.plan`` + layout tensors) OUTSIDE
+        # the compiled region. ``wrapper.plan`` does host-side
+        # ``indptr.to("cpu")`` + ``torch.empty(...)`` ops that fragment
+        # cudagraph partitions (decode) or simply aren't traceable as
+        # symbolic (prefill). After plan() runs eagerly, the compiled
+        # region sees only opaque ``wrapper.run(q, (k, v))`` (through
+        # the ``paged_attn_run`` custom op) and ``pool.append_kv`` —
+        # shape-stable in the decode case, symbolic-dynamic in the
+        # prefill case.
+        input_ids = kwargs.get("input_ids")
+        cache = kwargs.get("cache")
+
+        use_compiled_decode = (
+            self._compiled_decode_model is not None
+            and input_ids is not None
+            and input_ids.shape[1] == 1
+            and cache is not None
+        )
+        use_compiled_prefill = (
+            self._compiled_prefill_model is not None
+            and input_ids is not None
+            and input_ids.shape[1] > 1
+            and cache is not None
+        )
+
+        if use_compiled_decode or use_compiled_prefill:
+            from torchllms.models.paged_kv import PagedKVPool
+            if isinstance(cache, PagedKVPool):
+                B, S = input_ids.shape
+                pre_write, paged_ctx = self.model._build_forward_context(
+                    cache, S,
+                )
+                if kwargs.get("input_pos") is None:
+                    kwargs["input_pos"] = (
+                        torch.arange(
+                            S, dtype=torch.int32, device=input_ids.device,
+                        )[None, :]
+                        + pre_write[:, None]
+                    )
+                kwargs["paged_ctx"] = paged_ctx
+            compiled = (
+                self._compiled_decode_model
+                if use_compiled_decode
+                else self._compiled_prefill_model
+            )
+            return compiled(**kwargs)
         return self.model(**kwargs)
 
-    def set_activation_hooks(self, hooks, *, alpha: Optional[float] = None) -> None:
-        if not hasattr(self.model, "set_activation_hooks"):
-            raise NotImplementedError(
-                f"{type(self.model).__name__} does not expose activation hooks"
-            )
-        self.model.set_activation_hooks(hooks, alpha=alpha)
+    def register_intervention(
+        self,
+        module,
+        *,
+        layers,
+        role_ids=None,
+    ) -> None:
+        """Install an activation intervention on the underlying model.
 
-    def clear_activation_hooks(self) -> None:
-        if hasattr(self.model, "clear_activation_hooks"):
-            self.model.clear_activation_hooks()
+        See :meth:`torchllms.models.networks.Transformer.register_intervention`
+        for the module contract. When any intervention is registered, the
+        prefix cache read/insert paths in this driver clamp to the first
+        position whose role is in the intervention set — cached pages
+        before that boundary are baseline-clean and safely shareable;
+        pages at or past that boundary would carry intervention-modified
+        K/V and must neither be borrowed from nor inserted into the
+        radix.
+        """
+        if not hasattr(self.model, "register_intervention"):
+            raise NotImplementedError(
+                f"{type(self.model).__name__} does not expose interventions"
+            )
+        self.model.register_intervention(module, layers=layers, role_ids=role_ids)
+
+    def clear_interventions(self) -> None:
+        if hasattr(self.model, "clear_interventions"):
+            self.model.clear_interventions()
+
+    # Internal helpers for the prefix-cache clamp ------------------------
+
+    def _intervened_roles_set(self) -> Optional[set]:
+        """Return the union of role IDs currently targeted by registered
+        interventions. Mirrors :meth:`Transformer.intervened_roles`:
+
+          - ``None`` — some intervention matches all roles.
+          - ``set()`` — no interventions registered.
+          - ``set[int]`` — specific roles.
+        """
+        if not hasattr(self.model, "intervened_roles"):
+            return set()
+        return self.model.intervened_roles()
+
+    def _first_intervened_pos(self, role_id_list: Optional[List[int]]) -> Optional[int]:
+        """Earliest index in ``role_id_list`` whose role is currently
+        intervened, or ``None`` if no intervention overlaps.
+
+        Semantics:
+          - No interventions registered ⇒ always returns ``None``
+            (nothing to clamp).
+          - ``role_id_list is None`` while interventions are registered
+            ⇒ returns 0 if any intervention matches all roles, else
+            ``None`` (we have no role info to do better than the
+            coarse "all-or-nothing" bound).
+          - Otherwise scans ``role_id_list`` in order and returns the
+            first index whose role is in the intervened set.
+        """
+        roles = self._intervened_roles_set()
+        if roles is not None and len(roles) == 0:
+            return None  # no interventions
+        if roles is None:
+            # Matches-all intervention: every position is intervened.
+            return 0
+        if role_id_list is None:
+            # Specific roles requested but caller gave no role info;
+            # we can't identify the first intervened position, so be
+            # conservative and treat position 0 as the clamp (disables
+            # sharing). In practice _generate_* always passes role_ids
+            # for intervened runs, so this branch is defensive.
+            return 0
+        for i, r in enumerate(role_id_list):
+            if r in roles:
+                return i
+        return None
 
     def tokenize_conversation(self, conversation: List[Dict[str, str]]) -> torch.Tensor:
         inputs = {}
@@ -275,76 +491,120 @@ class LLM:
         else:
             asst_role = None
 
-        # Fixed max_cache_len = self.max_len (same rationale as
-        # _generate_multiple): stable cache tensor shape across calls so
-        # decode-compile doesn't recompile per-call.
-        cache = self.model.init_cache(1, self.device, max_cache_len=self.max_len)
+        # Long-lived LLM-owned cache. Claim a rollout; retire at end.
+        # try/finally ensures the rid is released even on an exception
+        # in prefill/decode — otherwise a leaked rid would make the next
+        # ``_generate_single`` call see a non-empty cache.
+        cache = self._ensure_cache()
         rid = cache.claim()
+        generated_token_ids: List[int] = []
+        stop_reason: Optional[int] = None
+        try:
+            # --- Prefix cache lookup ---------------------------------
+            # Page-aligned borrow: the radix returns page IDs the pool
+            # should borrow (ref++), then we attach them to this
+            # rollout's block table. Always leave ≥1 token to prefill
+            # so the forward produces fresh logits for the first
+            # sample. Round the borrow length DOWN to a page boundary
+            # — partial-page borrows would require copy-on-write on
+            # the shared page.
+            #
+            # Intervention clamp: if any activation intervention is
+            # registered, borrow only pages whose tokens sit strictly
+            # before the first intervened position in this prompt. Pages
+            # at or past that boundary would carry intervention-modified
+            # K/V on this rollout, so they must be recomputed fresh.
+            # The insert-side guard in ``_retire_and_insert`` mirrors
+            # this bound, so the radix only ever holds baseline-clean
+            # pages — making borrow strictly shareable across
+            # intervention configs.
+            prompt_tokens = input_ids.flatten().tolist()
+            prompt_role_list: Optional[List[int]] = (
+                role_ids.flatten().tolist() if role_ids is not None else None
+            )
+            first_intervened = self._first_intervened_pos(prompt_role_list)
+            prefill_start = 0
+            if self.prefix_cache is not None:
+                match = self.prefix_cache.lookup(prompt_tokens)
+                if match.hit:
+                    page_size = cache.page_size
+                    max_prefill = max(prompt_len - 1, 0)
+                    aligned = min(match.length, max_prefill)
+                    if first_intervened is not None:
+                        aligned = min(aligned, first_intervened)
+                    aligned -= aligned % page_size
+                    if aligned > 0:
+                        n_pages = aligned // page_size
+                        borrowed = match.page_ids[:n_pages]
+                        cache.borrow_pages(borrowed)
+                        cache.attach_borrowed_pages(rid, borrowed)
+                        prefill_start = aligned
 
-        # --- Prefix cache lookup -------------------------------------------
-        # If a RadixKVCache is attached, reuse the longest matching prefix so
-        # we skip re-prefilling tokens we've already computed KV for. Always
-        # leave at least ONE token to prefill so we can sample the next token
-        # from fresh logits.
-        prompt_tokens = input_ids.flatten().tolist()
-        prefill_start = 0
-        if self.prefix_cache is not None:
-            match = self.prefix_cache.lookup(prompt_tokens)
-            if match.hit:
-                # Leave 1 token for prefill so the forward produces logits.
-                prefill_start = min(match.length, prompt_len - 1)
-                if prefill_start > 0:
-                    chunk = match.materialize()
-                    # We only want the first `prefill_start` tokens of the
-                    # matched chunk, in case match.length > prefill_start.
-                    if chunk.length > prefill_start:
-                        chunk = chunk.slice(0, prefill_start)
-                    cache.load_chunk(chunk, rid)
+            # Prefill the remaining suffix.
+            suffix_ids = input_ids[:, prefill_start:]
+            suffix_roles = (
+                role_ids[:, prefill_start:] if role_ids is not None else None
+            )
+            logits, cache = self._model_forward(
+                input_ids=suffix_ids,
+                role_ids=suffix_roles,
+                cache=cache,
+                logits_to_keep=1,
+            )
+            cur_token, _ = inference.utils.sample(logits, temperature=temperature)
 
-        # Prefill the remaining suffix.
-        suffix_ids = input_ids[:, prefill_start:]
-        suffix_roles = (
-            role_ids[:, prefill_start:] if role_ids is not None else None
-        )
-        logits, cache = self._model_forward(
-            input_ids=suffix_ids,
-            role_ids=suffix_roles,
-            cache=cache,
-            logits_to_keep=1,
-        )
-        cur_token, _ = inference.utils.sample(logits, temperature=temperature)
+            cur = int(cur_token.squeeze().item())
+            generated_token_ids.append(cur)
+            if cur in self.eos_set:
+                stop_reason = cur
 
-        cur = int(cur_token.squeeze().item())
-        generated_token_ids: List[int] = [cur]
-        stop_reason: Optional[int] = cur if cur in self.eos_set else None
-
-        if stop_reason is None:
-            for i in range(1, max_new_tokens_):
-                logits, cache = self._model_forward(
-                    input_ids=cur_token.view(1, -1),
-                    role_ids=asst_role,
-                    cache=cache,
-                    logits_to_keep=1,
-                )
-                cur_token, _ = inference.utils.sample(logits, temperature=temperature)
-                cur = int(cur_token.squeeze().item())
-                generated_token_ids.append(cur)
-                if cur in self.eos_set:
-                    stop_reason = cur
-                    break
-            else:
-                # Loop completed without `break`: budget exhausted. Keep the
-                # warnings for humans tailing logs; callers that prefer a
-                # programmatic signal read `stop_reason is None`.
-                if max_new_tokens_ == max_new_tokens:
-                    print("[warning] max_new_tokens reached")
+            if stop_reason is None:
+                for i in range(1, max_new_tokens_):
+                    logits, cache = self._model_forward(
+                        input_ids=cur_token.view(1, -1),
+                        role_ids=asst_role,
+                        cache=cache,
+                        logits_to_keep=1,
+                    )
+                    cur_token, _ = inference.utils.sample(
+                        logits, temperature=temperature,
+                    )
+                    cur = int(cur_token.squeeze().item())
+                    generated_token_ids.append(cur)
+                    if cur in self.eos_set:
+                        stop_reason = cur
+                        break
                 else:
-                    print("[warning] max_len reached")
+                    # Loop completed without `break`: budget exhausted.
+                    if max_new_tokens_ == max_new_tokens:
+                        print("[warning] max_new_tokens reached")
+                    else:
+                        print("[warning] max_len reached")
 
-        # --- Prefix cache insert -------------------------------------------
-        # Stash the full (prompt + generated) KV so the next turn can reuse
-        # this prefix.
-        self._insert_prefix_cache(cache, rid, prompt_tokens + generated_token_ids)
+            # --- Retire + prefix-cache insert ------------------------
+            self._retire_and_insert(
+                cache,
+                rid,
+                prompt_tokens + generated_token_ids,
+                prompt_role_ids=prompt_role_list,
+                prompt_len=prompt_len,
+            )
+        except Exception:
+            # Ensure the rid is always released — otherwise subsequent
+            # generates see orphan live rollouts. Best-effort: if the
+            # rollout was already retired inside the try-block, this
+            # becomes a no-op because rid is removed from tracking.
+            try:
+                from torchllms.models.paged_kv import PagedKVPool
+                if isinstance(cache, PagedKVPool):
+                    if rid in cache._rollout_to_pages:
+                        pages, _ = cache.retire_pages(rid)
+                        cache.release_pages(pages)
+                elif rid in getattr(cache, "rollout_to_slot", {}):
+                    cache.retire(rid)
+            except Exception:
+                pass
+            raise
 
         # HF tokenizers accept skip_special_tokens; tiktoken (gpt-oss) doesn't.
         # Fall back to the plain decode signature rather than failing.
@@ -358,18 +618,67 @@ class LLM:
             stop_reason=stop_reason,
         )
 
-    def _insert_prefix_cache(self, cache, rid, full_tokens: List[int]) -> None:
-        if self.prefix_cache is None:
-            return
-        # row_positions[slot] is the authoritative count of real KV positions
-        # written for this rollout. Should equal len(full_tokens) after a
-        # normal prefill+decode loop.
-        slot = cache.resolve(rid)
-        length = int(cache.row_positions[slot].item())
-        if length <= 0:
-            return
-        chunk = cache.extract_chunk(rid, length=length)
-        self.prefix_cache.insert(full_tokens[:length], chunk)
+    def _retire_and_insert(
+        self,
+        cache,
+        rid,
+        full_tokens: List[int],
+        *,
+        prompt_role_ids: Optional[List[int]] = None,
+        prompt_len: Optional[int] = None,
+    ) -> None:
+        """Retire the rollout and insert its KV into the prefix cache (if
+        configured). Retire is unconditional — the pool / arena must not
+        keep state for a completed rollout, or the next call leaks.
+
+        PagedKVPool path: hands the page ID list to the radix for
+        adoption, then releases the rollout's refcounts. Pages in the
+        trie keep ref ≥ 1; partial-tail pages (not page-aligned at end)
+        are released without caching. KVArena path: retire only, no
+        prefix caching (KVArena migrates in Phase 4).
+
+        Intervention clamp: when any activation intervention is
+        registered, only pages whose tokens sit strictly before the
+        first intervened position are inserted. The radix therefore
+        only holds baseline-clean pages — mirroring the read-side
+        guard in ``_generate_single`` / ``_prefill_grouped``.
+        Generated tokens all take role ASSISTANT, so if ASSISTANT is
+        in the intervened set the insert boundary is additionally
+        clamped to ``prompt_len``.
+        """
+        from torchllms.models.paged_kv import PagedKVPool
+        if isinstance(cache, PagedKVPool):
+            pages, seqlen = cache.retire_pages(rid)
+            insert_len = seqlen
+            roles = self._intervened_roles_set()
+            if roles is None:
+                # Some intervention matches every role ⇒ every position
+                # is intervened ⇒ nothing is shareable.
+                insert_len = 0
+            elif len(roles) > 0:
+                first_int = self._first_intervened_pos(prompt_role_ids)
+                if first_int is not None:
+                    insert_len = min(insert_len, first_int)
+                if (
+                    int(tokenization.Role.ASSISTANT) in roles
+                    and prompt_len is not None
+                ):
+                    insert_len = min(insert_len, prompt_len)
+
+            if (
+                self.prefix_cache is not None
+                and insert_len >= cache.page_size
+            ):
+                n_full = insert_len // cache.page_size
+                self.prefix_cache.insert(
+                    full_tokens[: n_full * cache.page_size],
+                    pages[:n_full],
+                )
+            cache.release_pages(pages)
+        else:
+            # KVArena (gpt-oss, olmo). No prefix caching in Phase 1/2;
+            # just release the rollout to reclaim the slot.
+            cache.retire(rid)
 
     def generate_unbatched(
         self,
@@ -532,57 +841,78 @@ class LLM:
 
         # Per-row prefix-cache lookup. Leave ≥1 suffix token per row so the
         # prefill forward produces fresh logits for the first sample.
+        # Borrow length is page-aligned to avoid copy-on-write on shared
+        # pages. When any intervention is registered, the borrow length
+        # is additionally clamped to each row's first intervened position
+        # (see ``_generate_single`` for the full rationale).
         prefill_starts = [0] * B
-        prefix_chunks: List[Optional[object]] = [None] * B
-        if self.prefix_cache is not None:
+        prefix_page_ids: List[Optional[tuple]] = [None] * B
+        page_size_attr = getattr(self.cache, "page_size", None)
+        if self.prefix_cache is not None and page_size_attr is not None:
             for i, prompt in enumerate(prompt_token_lists):
                 match = self.prefix_cache.lookup(prompt)
                 if match.hit:
-                    ps = min(match.length, prompt_lens[i] - 1)
-                    if ps > 0:
-                        chunk = match.materialize()
-                        if chunk.length > ps:
-                            chunk = chunk.slice(0, ps)
-                        prefill_starts[i] = ps
-                        prefix_chunks[i] = chunk
+                    max_prefill = max(prompt_lens[i] - 1, 0)
+                    aligned = min(match.length, max_prefill)
+                    row_roles = (
+                        role_id_lists[i] if role_id_lists is not None else None
+                    )
+                    first_int = self._first_intervened_pos(row_roles)
+                    if first_int is not None:
+                        aligned = min(aligned, first_int)
+                    aligned -= aligned % page_size_attr
+                    if aligned > 0:
+                        n_pages = aligned // page_size_attr
+                        prefill_starts[i] = aligned
+                        prefix_page_ids[i] = match.page_ids[:n_pages]
 
-        # Use a FIXED max_cache_len = self.max_len so every call to
-        # _generate_multiple allocates a cache of identical shape. This is
-        # load-bearing for decode-compile: Dynamo specializes on input
-        # tensor shapes, so a cache whose seqlen dim varies per wave (as
-        # the previous adaptive `max_prompt_len + max_budget` did) forces
-        # recompilation on every wave, hanging the run. Trade-off: extra
-        # KV memory proportional to self.max_len - (max_prompt_len +
-        # max_budget). For Qwen3-4B bf16 at max_len=40960, batch=4 this
-        # is ~8 GB of extra allocation vs adaptive, which fits on a 32 GB
-        # GPU. Shrink --max-seq-len if memory is tight.
-        cache = self.model.init_cache(B, self.device, max_cache_len=self.max_len)
+        # Long-lived LLM-owned cache. B must fit within ``self.max_bsz``
+        # (for KVArena that's a hard cap; for PagedKVPool it's the slot-
+        # count we sized the pool for, which is a page-budget constraint
+        # in disguise — oversize B can run out of pages at extend time).
+        if B > self.max_bsz:
+            raise RuntimeError(
+                f"_generate_multiple batch={B} > LLM.max_bsz={self.max_bsz}"
+            )
+        cache = self._ensure_cache()
+        if cache.b_live != 0:
+            raise RuntimeError(
+                f"_generate_multiple entered with non-empty cache "
+                f"(b_live={cache.b_live}); caller leaked rollouts"
+            )
 
         rids: List[RolloutId] = [cache.claim() for _ in range(B)]
         origin_of: Dict[RolloutId, int] = {rid: i for i, rid in enumerate(rids)}
         generated: Dict[RolloutId, List[int]] = {rid: [] for rid in rids}
         stop_reasons: Dict[RolloutId, Optional[int]] = {rid: None for rid in rids}
 
-        def _retire_and_insert(to_retire: List[RolloutId]) -> None:
-            if not to_retire:
-                return
-            chunks = cache.retire_many(to_retire)
-            if self.prefix_cache is None:
-                return
-            for rid, chunk in zip(to_retire, chunks):
-                if chunk.length <= 0:
-                    continue
+        def _retire_batch(to_retire: List[RolloutId]) -> None:
+            """Retire a batch of rollouts and hand their page-aligned KV
+            to the prefix cache (if enabled)."""
+            for rid in to_retire:
                 i = origin_of[rid]
                 gen = generated[rid]
-                total_tokens = prompt_token_lists[i] + gen[:-1]
-                self.prefix_cache.insert(total_tokens[: chunk.length], chunk)
+                # The last sampled token's KV isn't yet in the cache
+                # (we sampled it but haven't run a forward on it), so it
+                # doesn't enter the prefix-cache insert.
+                full_tokens = prompt_token_lists[i] + gen[:-1]
+                row_roles = (
+                    role_id_lists[i] if role_id_lists is not None else None
+                )
+                self._retire_and_insert(
+                    cache,
+                    rid,
+                    full_tokens,
+                    prompt_role_ids=row_roles,
+                    prompt_len=prompt_lens[i],
+                )
 
         # ---- Prefill ----
         # Group by (prefill_start, prompt_len). Single-group runs directly
         # on the main arena; multi-group uses temp arenas + chunk transfer.
         first_tokens = self._prefill_grouped(
             cache, rids, prompt_token_lists, role_id_lists,
-            prefill_starts, prefix_chunks, temperature,
+            prefill_starts, prefix_page_ids, temperature,
         )
 
         # Record first sampled token for every row; mark stops.
@@ -595,7 +925,7 @@ class LLM:
                 to_retire_now.append(rid)
             elif len(generated[rid]) >= budgets[origin_of[rid]]:
                 to_retire_now.append(rid)
-        _retire_and_insert(to_retire_now)
+        _retire_batch(to_retire_now)
 
         # ---- Decode ----
         # Every decode forward has seqlen == 1; ``Attention.forward``
@@ -638,10 +968,10 @@ class LLM:
                     step_retires.append(rid)
                 elif len(generated[rid]) >= budgets[origin_of[rid]]:
                     step_retires.append(rid)
-            _retire_and_insert(step_retires)
+            _retire_batch(step_retires)
 
         if cache.b_live > 0:
-            _retire_and_insert(list(cache.active_rollouts()))
+            _retire_batch(list(cache.active_rollouts()))
 
         for rid in rids:
             i = origin_of[rid]
@@ -663,37 +993,50 @@ class LLM:
         prompt_token_lists: List[List[int]],
         role_id_lists: Optional[List[List[int]]],
         prefill_starts: List[int],
-        prefix_chunks: List[Optional[object]],
+        prefix_page_ids: List[Optional[tuple]],
         temperature: float,
     ) -> List[int]:
         """Group rows by ``(prefill_start, prompt_len)``. One batched
         prefill per group.
 
-        Single-group case (all rows share shape) writes directly to the
-        main arena: fastest path, no chunk copies. Multi-group case uses
-        a temp arena per group and copies final chunks into the main arena.
+        Single-group fast path: every row in the batch shares the same
+        (prefill_start, prompt_len). Rows with a radix hit borrow the
+        matched pages into their main-cache rid (``borrow_pages`` +
+        ``attach_borrowed_pages``). All rows then run a single batched
+        prefill on the suffix.
 
-        Within each group, rows may have different radix matches (same
-        length but different tokens), so each row's chunk is loaded into
-        its own slot before the batched suffix forward.
+        Multi-group path: heterogeneous prefix_start or prompt_len within
+        the batch. The prefix cache is skipped for simplicity (each
+        row's prefill_start is forced to 0) and each group prefills
+        through a tmp cache + KVChunk round-trip into the main cache.
+        Multi-group is the uncommon case; the Phase 4 plan is to fold
+        it into a page-table copy so the KVChunk round-trip disappears
+        from the multi-group path too.
 
         Returns first-tokens in row order.
         """
         B = len(rids)
         first_tokens: List[int] = [0] * B
 
-        # Group rows by (prefill_start, prompt_len).
+        # Group by (prefill_start, prompt_len).
         groups: Dict[tuple, List[int]] = {}
         for i in range(B):
             key = (prefill_starts[i], len(prompt_token_lists[i]))
             groups.setdefault(key, []).append(i)
 
         if len(groups) == 1:
-            # Fast path: one group matching the main arena.
+            # Fast path: one group matching the main cache.
             prefill_start, _prompt_len = next(iter(groups))
-            for i, rid in enumerate(rids):
-                if prefix_chunks[i] is not None:
-                    cache.load_chunk(prefix_chunks[i], rid)
+            # Per-row prefix borrow (only needed for PagedKVPool; KVArena
+            # doesn't have borrow_pages and can't share pages across rows).
+            borrow_fn = getattr(cache, "borrow_pages", None)
+            attach_fn = getattr(cache, "attach_borrowed_pages", None)
+            if borrow_fn is not None and attach_fn is not None:
+                for i, rid in enumerate(rids):
+                    pids = prefix_page_ids[i]
+                    if pids:
+                        borrow_fn(pids)
+                        attach_fn(rid, pids)
             suffix_ids_list = [
                 prompt_token_lists[i][prefill_start:] for i in range(B)
             ]
@@ -719,21 +1062,22 @@ class LLM:
                 first_tokens[i] = int(tok)
             return first_tokens
 
-        # Multi-group: per-group temp arena, extract final chunks, load
-        # into the main arena.
-        for (prefill_start, prompt_len), indices in groups.items():
+        # Multi-group: drop the prefix cache, prefill each group via a
+        # tmp cache + KVChunk round-trip into the main cache. See the
+        # docstring for why we accept the D2H/H2D cost here.
+        regroups: Dict[int, List[int]] = {}
+        for i in range(B):
+            regroups.setdefault(len(prompt_token_lists[i]), []).append(i)
+
+        for prompt_len, indices in regroups.items():
             group_B = len(indices)
             tmp = self.model.init_cache(
                 group_B, self.device, max_cache_len=prompt_len + 1,
             )
             tmp_rids = [tmp.claim() for _ in indices]
-            # Load each row's radix chunk into its temp-arena slot.
-            for idx_in_group, orig_i in enumerate(indices):
-                if prefix_chunks[orig_i] is not None:
-                    tmp.load_chunk(prefix_chunks[orig_i], tmp_rids[idx_in_group])
 
             suffix_ids_list = [
-                prompt_token_lists[orig_i][prefill_start:] for orig_i in indices
+                prompt_token_lists[orig_i] for orig_i in indices
             ]
             suffix_t = torch.tensor(
                 suffix_ids_list, dtype=torch.long, device=self.device,
@@ -741,7 +1085,7 @@ class LLM:
             roles_t = None
             if role_id_lists is not None:
                 suffix_roles = [
-                    role_id_lists[orig_i][prefill_start:] for orig_i in indices
+                    role_id_lists[orig_i] for orig_i in indices
                 ]
                 roles_t = torch.tensor(
                     suffix_roles, dtype=torch.long, device=self.device,
